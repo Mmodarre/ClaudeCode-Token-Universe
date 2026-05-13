@@ -48,100 +48,23 @@ from jinja2 import Template
 # Model display names — extend here when new models appear. Anything not in
 # this map falls back to the raw model id, which still renders fine but loses
 # the friendly label.
-MODEL_SHORT: dict[str, str] = {
-    "claude-opus-4-7": "Opus 4.7",
-    "claude-opus-4-6": "Opus 4.6",
-    "claude-opus-4-5-20251101": "Opus 4.5",
-    "claude-haiku-4-5-20251001": "Haiku 4.5",
-    "claude-sonnet-4-6": "Sonnet 4.6",
-    "claude-sonnet-4-5-20250929": "Sonnet 4.5",
-}
+_MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$")
 
-# Canonicalization rules for the AI-extracted theme list. Each entry is
-# (canonical_name, [substring_patterns]) — case-insensitive. The first matching
-# rule wins; anything that matches nothing passes through unchanged.
-# Heavily Databricks-flavored — extend per audience.
-THEME_CANON: list[tuple[str, list[str]]] = [
-    ("Delta Live Tables / Lakeflow", [
-        "dlt", "delta live table", "lakeflow", "apply_changes", "auto loader",
-        "autoloader", "@dlt", "streaming table", "materialized view",
-    ]),
-    ("Databricks Apps (OBO auth)", [
-        "databricks app", "obo ", "on-behalf-of", "on behalf of",
-    ]),
-    ("Databricks Model Serving", [
-        "model serving", "serving endpoint", "serving-endpoint",
-    ]),
-    ("Databricks Asset Bundles", [
-        "asset bundle", "databricks bundle", "dab ", "dabs ",
-    ]),
-    ("Databricks metric views", [
-        "metric view", "measure(", "uc metric",
-    ]),
-    ("Databricks VARIANT type", [
-        "variant ", "variant type", "variant streaming",
-    ]),
-    ("Delta Lake Change Data Feed", [
-        "change data feed", "cdf ", "readchangefeed",
-    ]),
-    ("Databricks Repos / Git API", [
-        "repos api", "databricks repos", "git api",
-    ]),
-    ("Databricks structured streaming", [
-        "structured streaming", "spark streaming", "foreachbatch",
-    ]),
-    ("Databricks pipeline frameworks", [
-        "dbt vs", "vs dbt", "pipeline framework",
-    ]),
-    ("OpenCode CLI", [
-        "opencode",
-    ]),
-    ("Monaco editor (web IDE)", [
-        "monaco-editor", "monaco editor",
-    ]),
-    ("Git OAuth & credentials", [
-        "github oauth", "git oauth", "git credential", "azure devops oauth",
-        "gho_", "oauth app",
-    ]),
-    ("YAML / config-as-code", [
-        "yaml template", "yaml config", "config-as-code", "jinja2", "jinja ",
-    ]),
-    ("uv / Python tooling", [
-        "uv python", "uv package", "astral uv", "pyproject.toml",
-    ]),
-    ("Documentation platforms & frameworks", [
-        "readthedocs", "sphinx", "mkdocs", "docusaurus", "gitbook", "netlify",
-        "vercel", "cloudflare pages",
-    ]),
-    ("Documentation structure best practices", [
-        "diataxis", "documentation best practice", "docs structure",
-    ]),
-    ("MCP servers", [
-        "mcp server", "serena mcp", "playwright mcp",
-    ]),
-    ("Anthropic tooling", [
-        "claude code settings", "claude_code_", "anthropic_auth", "anthropic admin",
-        "anthropic sdk",
-    ]),
-    ("Lakehouse Plumber", [
-        "lakehouse plumber", "lhp ", "lhp.yaml",
-    ]),
-    ("Gmail / email", [
-        "gmail", "imap", "himalaya email",
-    ]),
-    ("Secrets / encryption", [
-        "secret scope", "fernet", "aes encryption", "token storage",
-    ]),
-    ("Workspace / multi-tenant", [
-        "multi-tenant", "per-user", "concurrent editing",
-    ]),
-    ("Pipeline testing", [
-        "pytest", "unit test", "dbt unit test", "dry-run", "dry run pipeline",
-    ]),
-    ("DLT data quality & quarantine", [
-        "data quality", "dqx", "apply_checks", "quarantine",
-    ]),
-]
+
+def model_short_name(model_id: str) -> str:
+    """Derive ``'Opus 4.7'`` from ``'claude-opus-4-7-20251101'`` at runtime.
+
+    Anthropic's model IDs follow ``claude-<family>-<major>-<minor>[-<date>]``,
+    so no static dict is needed. Unknown shapes pass through unchanged so a
+    new family or naming convention won't break the dashboard.
+    """
+    if not model_id:
+        return ""
+    m = _MODEL_ID_RE.match(model_id)
+    if m:
+        family, major, minor = m.group(1), m.group(2), m.group(3)
+        return f"{family.title()} {major}.{minor}"
+    return model_id
 
 
 # --------------------------------------------------------------------------- #
@@ -710,7 +633,7 @@ def walk_with_events(
                         if proj_name is None:
                             proj_name = "(unknown)"
                         proj_idx = intern("projects", proj_name)
-                        model_short = MODEL_SHORT.get(model_raw, model_raw or "(unknown)")
+                        model_short = model_short_name(model_raw) or "(unknown)"
                         model_idx = intern("models", model_short)
                         server_idx = intern("servers", server_name) if server_name else 0
                         tool_idx = intern("tools", mcp_tool_name) if mcp_tool_name else 0
@@ -1090,26 +1013,28 @@ def classify_sessions(
 
 
 def merge_themes(themes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Canonicalize and merge per-chunk themes into a single ranked list."""
+    """Merge per-chunk themes into one ranked list by case-insensitive text.
+
+    Previously this used a hand-curated table of canonical names and substring
+    patterns. That table was Databricks-flavored and useless to anyone else,
+    so it's gone. The 4 parallel Haiku calls already produce fairly consistent
+    names within a single dataset; case-insensitive dedupe handles the rest.
+    Truly redundant themes (e.g. "Databricks Apps" + "databricks apps") merge;
+    everything else passes through. Some users will see a few near-duplicates
+    in the wordcloud — that's the price of portability.
+    """
     bucket: dict[str, dict[str, Any]] = {}
-
-    def canonicalize(label: str) -> str:
-        low = label.lower()
-        for canon, patterns in THEME_CANON:
-            if any(p in low for p in patterns):
-                return canon
-        return label
-
     for t in themes:
-        key = canonicalize(t["text"])
-        slot = bucket.setdefault(key, {"text": key, "weight": 0, "examples": []})
+        key = (t["text"] or "").strip()
+        if not key:
+            continue
+        lookup = key.lower()
+        slot = bucket.setdefault(lookup, {"text": key, "weight": 0, "examples": []})
         slot["weight"] += t["weight"]
         for ex in t["examples"]:
             if ex not in slot["examples"] and len(slot["examples"]) < 5:
                 slot["examples"].append(ex)
-
-    merged = sorted(bucket.values(), key=lambda r: r["weight"], reverse=True)
-    return merged
+    return sorted(bucket.values(), key=lambda r: r["weight"], reverse=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2041,27 +1966,74 @@ const compact = n => {
   return String(n);
 };
 
-const MODEL_COLOR = {
-  'claude-opus-4-7':            getComputedStyle(document.documentElement).getPropertyValue('--opus-7').trim(),
-  'claude-opus-4-6':            getComputedStyle(document.documentElement).getPropertyValue('--opus-6').trim(),
-  'claude-opus-4-5-20251101':   getComputedStyle(document.documentElement).getPropertyValue('--opus-5').trim(),
-  'claude-haiku-4-5-20251001':  getComputedStyle(document.documentElement).getPropertyValue('--haiku-5').trim(),
-  'claude-sonnet-4-6':          getComputedStyle(document.documentElement).getPropertyValue('--sonnet-6').trim(),
-  'claude-sonnet-4-5-20250929': getComputedStyle(document.documentElement).getPropertyValue('--sonnet-5').trim(),
+// Anthropic model IDs follow `claude-<family>-<major>-<minor>[-<date>]`.
+// Deriving the short label at runtime means a new model id (e.g. when
+// Opus 4.8 ships) lands in the dashboard without a code change.
+const _MODEL_ID_RE = /^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$/;
+const _SHORT_CACHE = new Map();
+function shortOf(modelId) {
+  if (!modelId) return '';
+  if (_SHORT_CACHE.has(modelId)) return _SHORT_CACHE.get(modelId);
+  const m = _MODEL_ID_RE.exec(modelId);
+  const label = m
+    ? `${m[1][0].toUpperCase() + m[1].slice(1)} ${m[2]}.${m[3]}`
+    : modelId;
+  _SHORT_CACHE.set(modelId, label);
+  return label;
+}
+
+// Colors are generated from the model id so new models get a stable,
+// deterministic hue without anyone editing a palette. The family steers
+// the base hue (Opus = coral, Sonnet = warm brown, Haiku = light tan,
+// anything else = neutral) and the version offsets lightness so newer
+// versions render slightly brighter than older ones.
+const _COLOR_CACHE = new Map();
+const _FAMILY_HUES = {
+  opus:   { h: 14,  s: 52 },
+  sonnet: { h: 22,  s: 38 },
+  haiku:  { h: 32,  s: 48 },
 };
-const MODEL_SHORT_JS = {
-  'claude-opus-4-7':            'Opus 4.7',
-  'claude-opus-4-6':            'Opus 4.6',
-  'claude-opus-4-5-20251101':   'Opus 4.5',
-  'claude-haiku-4-5-20251001':  'Haiku 4.5',
-  'claude-sonnet-4-6':          'Sonnet 4.6',
-  'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
-};
-const SHORT_TO_RAW = Object.fromEntries(
-  Object.entries(MODEL_SHORT_JS).map(([raw, short]) => [short, raw])
-);
-const colorOf = m => MODEL_COLOR[m] || '#888';
-const shortOf = m => MODEL_SHORT_JS[m] || m;
+function colorOf(modelId) {
+  if (!modelId) return '#888';
+  if (_COLOR_CACHE.has(modelId)) return _COLOR_CACHE.get(modelId);
+  const m = _MODEL_ID_RE.exec(modelId);
+  let color;
+  if (m) {
+    const family = m[1].toLowerCase();
+    const minor = parseInt(m[3], 10);
+    const base = _FAMILY_HUES[family];
+    if (base) {
+      // Map minor version into a 28-62 lightness band — newer minors are
+      // lighter / more brand-coral, older minors are darker brown. Mirrors
+      // the original Anthropic palette where Opus 4.7 was the brand coral.
+      const lum = Math.max(28, Math.min(62, 30 + (minor - 4) * 8));
+      color = `hsl(${base.h}, ${base.s}%, ${lum}%)`;
+    }
+  }
+  if (!color) {
+    // Unknown family — hash the id into a coral-adjacent palette so the page
+    // stays on-brand. djb2 hash → palette index.
+    const palette = ['#CC785C','#A55A40','#7A4F37','#B07F5C','#D4A27F','#5C4838'];
+    let h = 5381;
+    for (let i = 0; i < modelId.length; i++) h = ((h << 5) + h) + modelId.charCodeAt(i);
+    color = palette[Math.abs(h) % palette.length];
+  }
+  _COLOR_CACHE.set(modelId, color);
+  return color;
+}
+
+// Inverse: short label → raw id. Built incrementally as shortOf() runs;
+// looked up in places that need to map from a filter selection (which
+// stores short names) back to a raw model id (used as a key in
+// DATA.modelUsage / dailyModelTokens.tokensByModel).
+const SHORT_TO_RAW = {};
+function rememberShort(rawId) {
+  if (rawId) SHORT_TO_RAW[shortOf(rawId)] = rawId;
+}
+for (const raw of Object.keys(DATA.modelUsage || {})) rememberShort(raw);
+for (const d of (DATA.dailyModelTokens || [])) {
+  for (const raw of Object.keys(d.tokensByModel || {})) rememberShort(raw);
+}
 
 // ============== Chart.js defaults ==============
 Chart.defaults.font.family = "'Inter', ui-sans-serif, system-ui, sans-serif";
@@ -2254,10 +2226,21 @@ function renderDailyChart(dailyClipped) {
   const dates = dailyClipped.map(d => d.date);
   const modelsInUse = new Set();
   dailyClipped.forEach(d => Object.keys(d.tokensByModel).forEach(m => modelsInUse.add(m)));
-  const orderedKnown = ['claude-opus-4-7','claude-opus-4-6','claude-opus-4-5-20251101',
-                        'claude-haiku-4-5-20251001','claude-sonnet-4-6','claude-sonnet-4-5-20250929'];
-  const orderedModels = orderedKnown.filter(m => modelsInUse.has(m))
-    .concat([...modelsInUse].filter(m => !orderedKnown.includes(m)));
+  // Order by family then version descending, so the user sees their newest
+  // models first. Unknown families sort alphabetically at the end.
+  const FAMILY_ORDER = { opus: 0, sonnet: 1, haiku: 2 };
+  const orderedModels = [...modelsInUse].sort((a, b) => {
+    const ma = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(a);
+    const mb = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(b);
+    if (!ma && !mb) return a.localeCompare(b);
+    if (!ma) return 1; if (!mb) return -1;
+    const fa = FAMILY_ORDER[ma[1]] ?? 99;
+    const fb = FAMILY_ORDER[mb[1]] ?? 99;
+    if (fa !== fb) return fa - fb;
+    const va = parseInt(ma[2]) * 100 + parseInt(ma[3]);
+    const vb = parseInt(mb[2]) * 100 + parseInt(mb[3]);
+    return vb - va;   // newer first
+  });
   const datasets = orderedModels.map(model => ({
     label: shortOf(model),
     data: dailyClipped.map(d => d.tokensByModel[model] || 0),
@@ -2372,10 +2355,21 @@ function renderMonthly(dailyClipped) {
   const months = Object.keys(byMonth).sort();
   const modelsInUse = new Set();
   for (const m of months) Object.keys(byMonth[m]).forEach(k => modelsInUse.add(k));
-  const orderedKnown = ['claude-opus-4-7','claude-opus-4-6','claude-opus-4-5-20251101',
-                        'claude-haiku-4-5-20251001','claude-sonnet-4-6','claude-sonnet-4-5-20250929'];
-  const orderedModels = orderedKnown.filter(m => modelsInUse.has(m))
-    .concat([...modelsInUse].filter(m => !orderedKnown.includes(m)));
+  // Order by family then version descending, so the user sees their newest
+  // models first. Unknown families sort alphabetically at the end.
+  const FAMILY_ORDER = { opus: 0, sonnet: 1, haiku: 2 };
+  const orderedModels = [...modelsInUse].sort((a, b) => {
+    const ma = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(a);
+    const mb = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(b);
+    if (!ma && !mb) return a.localeCompare(b);
+    if (!ma) return 1; if (!mb) return -1;
+    const fa = FAMILY_ORDER[ma[1]] ?? 99;
+    const fb = FAMILY_ORDER[mb[1]] ?? 99;
+    if (fa !== fb) return fa - fb;
+    const va = parseInt(ma[2]) * 100 + parseInt(ma[3]);
+    const vb = parseInt(mb[2]) * 100 + parseInt(mb[3]);
+    return vb - va;   // newer first
+  });
   const datasets = orderedModels.map(model => ({
     label: shortOf(model),
     data: months.map(m => byMonth[m][model] || 0),
@@ -3255,7 +3249,8 @@ function updateFilterBadges() {
 }
 
 function populateAllPopovers() {
-  // Models: known short names from MODEL_SHORT_JS first, then any extra dims.
+  // Models: labels derived at runtime by shortOf() inside walk_with_events,
+  // already in DIMS.models as short names.
   const modelOpts = DIMS.models.map((label, i) => ({ label, value: i }))
     .sort((a, b) => a.label.localeCompare(b.label));
   buildPopover('popModels', modelOpts, state.models, false);
