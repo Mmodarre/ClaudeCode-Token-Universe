@@ -50,6 +50,13 @@ from jinja2 import Template
 # the friendly label.
 _MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+)-(\d+)(?:-\d+)?$")
 
+# Pseudo-models that Claude Code writes into JSONL transcripts for assistant
+# turns that never hit the API: harness-injected refusal messages, no-op
+# "no response requested" placeholders, and replayed state on resumed sessions.
+# Every record carries zero tokens in every class. We drop them so they don't
+# clutter the model mix, donut chart, daily/monthly breakdown, or full table.
+_NON_BILLABLE_MODELS: frozenset[str] = frozenset({"<synthetic>"})
+
 
 def model_short_name(model_id: str) -> str:
     """Derive ``'Opus 4.7'`` from ``'claude-opus-4-7-20251101'`` at runtime.
@@ -65,6 +72,76 @@ def model_short_name(model_id: str) -> str:
         family, major, minor = m.group(1), m.group(2), m.group(3)
         return f"{family.title()} {major}.{minor}"
     return model_id
+
+
+# --------------------------------------------------------------------------- #
+# Model pricing                                                               #
+# --------------------------------------------------------------------------- #
+#
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
+# Fetched on 2026-05-14. Prices are in USD per million (1e6) tokens, standard
+# (non-batch, non-fast-mode) rates.
+#
+# `cache_write_5m` is the default Claude Code uses for the 5-minute TTL; the
+# JSONL `cache_creation_input_tokens` field does not distinguish 5m vs 1h, so
+# we apply this rate uniformly. If you opted into 1h caches the displayed cost
+# will under-estimate cache-write spend (real rate is 2× input instead of
+# 1.25×). Anthropic's stated multipliers: cache_write_5m = 1.25× input,
+# cache_write_1h = 2× input, cache_read = 0.1× input.
+#
+# Keys are ``(family, major, minor)`` tuples matching the parsed model id.
+# Edit this table when Anthropic publishes new rates.
+MODEL_PRICING: dict[tuple[str, str, str], dict[str, float]] = {
+    ("opus", "4", "7"):   {"input":  5.00, "output": 25.00, "cache_write_5m":  6.25, "cache_read": 0.50},
+    ("opus", "4", "6"):   {"input":  5.00, "output": 25.00, "cache_write_5m":  6.25, "cache_read": 0.50},
+    ("opus", "4", "5"):   {"input":  5.00, "output": 25.00, "cache_write_5m":  6.25, "cache_read": 0.50},
+    ("opus", "4", "1"):   {"input": 15.00, "output": 75.00, "cache_write_5m": 18.75, "cache_read": 1.50},
+    ("opus", "4", "0"):   {"input": 15.00, "output": 75.00, "cache_write_5m": 18.75, "cache_read": 1.50},
+    ("sonnet", "4", "6"): {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_read": 0.30},
+    ("sonnet", "4", "5"): {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_read": 0.30},
+    ("sonnet", "4", "0"): {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_read": 0.30},
+    ("sonnet", "3", "7"): {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_read": 0.30},
+    ("haiku", "4", "5"):  {"input":  1.00, "output":  5.00, "cache_write_5m":  1.25, "cache_read": 0.10},
+    ("haiku", "3", "5"):  {"input":  0.80, "output":  4.00, "cache_write_5m":  1.00, "cache_read": 0.08},
+    ("opus", "3", "0"):   {"input": 15.00, "output": 75.00, "cache_write_5m": 18.75, "cache_read": 1.50},
+    ("haiku", "3", "0"):  {"input":  0.25, "output":  1.25, "cache_write_5m":  0.30, "cache_read": 0.03},
+}
+PRICING_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
+PRICING_FETCHED_ON = "2026-05-14"
+
+
+def model_price(model_id: str) -> dict[str, float] | None:
+    """Return the per-MTok price dict for a model id, or None if unknown.
+
+    Falls back through (major, minor) → (major, "0") → None. Anthropic's
+    "Opus 4" and "Sonnet 4" entries are encoded with minor=0 above; an
+    explicit `claude-opus-4-20250514` id without a minor still matches.
+    """
+    if not model_id:
+        return None
+    m = _MODEL_ID_RE.match(model_id)
+    if not m:
+        return None
+    family, major, minor = m.group(1), m.group(2), m.group(3)
+    return MODEL_PRICING.get((family, major, minor))
+
+
+def model_cost(model_id: str, usage: dict[str, int]) -> float:
+    """Apply the per-MTok rates to a usage dict; returns USD.
+
+    Usage dict uses the cache's own field names (``inputTokens`` etc.) so
+    this can be called against both ``stats['modelUsage'][m]`` entries
+    and the delta-style dicts produced by ``compute_live_delta``.
+    """
+    p = model_price(model_id)
+    if not p:
+        return 0.0
+    return (
+        usage.get("inputTokens", 0) * p["input"]
+        + usage.get("outputTokens", 0) * p["output"]
+        + usage.get("cacheCreationInputTokens", 0) * p["cache_write_5m"]
+        + usage.get("cacheReadInputTokens", 0) * p["cache_read"]
+    ) / 1_000_000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -86,10 +163,23 @@ def parse_stats_cache(claude_dir: Path) -> dict[str, Any]:
         )
     raw = json.loads(cache_path.read_text())
 
-    monthly: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    model_usage = {
+        m: v for m, v in (raw.get("modelUsage") or {}).items()
+        if m not in _NON_BILLABLE_MODELS
+    }
+    daily_model_tokens: list[dict[str, Any]] = []
     for d in raw.get("dailyModelTokens", []):
+        filtered_tbm = {
+            m: t for m, t in (d.get("tokensByModel") or {}).items()
+            if m not in _NON_BILLABLE_MODELS
+        }
+        if filtered_tbm:
+            daily_model_tokens.append({"date": d.get("date", ""), "tokensByModel": filtered_tbm})
+
+    monthly: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for d in daily_model_tokens:
         month = d["date"][:7]
-        for model, tokens in d.get("tokensByModel", {}).items():
+        for model, tokens in d["tokensByModel"].items():
             monthly[month][model] += tokens
 
     return {
@@ -98,9 +188,9 @@ def parse_stats_cache(claude_dir: Path) -> dict[str, Any]:
         "totalSessions": raw.get("totalSessions", 0),
         "totalMessages": raw.get("totalMessages", 0),
         "longestSession": raw.get("longestSession", {}),
-        "modelUsage": raw.get("modelUsage", {}),
+        "modelUsage": model_usage,
         "dailyActivity": raw.get("dailyActivity", []),
-        "dailyModelTokens": raw.get("dailyModelTokens", []),
+        "dailyModelTokens": daily_model_tokens,
         "hourCounts": raw.get("hourCounts", {}),
         "monthlyIO": {m: dict(v) for m, v in monthly.items()},
     }
@@ -156,6 +246,155 @@ def _iter_tool_uses(claude_dir: Path):
                         yield date, block.get("name") or "", block.get("input") or {}
         except OSError:
             continue
+
+
+def _iter_assistant_usage(claude_dir: Path, after_date: str | None):
+    """Yield ``(date, raw_model_id, usage_dict, session_id)`` per assistant
+    message whose date > ``after_date``. Deduped by ``message.id``.
+
+    Sibling of ``_iter_tool_uses``. ``usage`` is recorded **once per
+    assistant message** (not per content block), so we dedupe by
+    ``message.id`` here rather than by ``block.id``. The ``after_date``
+    filter is the cache's ``lastComputedDate``; we walk only the tail.
+    """
+    seen_message_ids: set[str] = set()
+    projects = claude_dir / "projects"
+    if not projects.exists():
+        return
+    for jsonl in projects.glob("**/*.jsonl"):
+        session_id = jsonl.stem
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg = rec.get("message") or {}
+                    mid = msg.get("id")
+                    if not mid or mid in seen_message_ids:
+                        continue
+                    seen_message_ids.add(mid)
+                    ts = rec.get("timestamp") or msg.get("timestamp") or ""
+                    date = ts[:10] if isinstance(ts, str) else ""
+                    if after_date and date and date <= after_date:
+                        continue
+                    usage = msg.get("usage") or {}
+                    yield date, msg.get("model") or "", usage, session_id
+        except OSError:
+            continue
+
+
+def compute_live_delta(
+    claude_dir: Path, last_computed_date: str | None
+) -> dict[str, Any]:
+    """Compute the post-cache delta from raw JSONL transcripts.
+
+    ``stats-cache.json`` only stores data through ``last_computed_date``
+    (set by Claude Code itself, typically yesterday at best). This walks
+    every assistant turn dated strictly after that and returns a
+    delta-shaped dict that mirrors the cache's own keys, ready to merge.
+    """
+    delta_by_model: dict[str, dict[str, int]] = defaultdict(lambda: {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    })
+    delta_daily: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    sessions_seen: set[str] = set()
+    msg_count = 0
+    for date, model, usage, sess in _iter_assistant_usage(
+        claude_dir, last_computed_date
+    ):
+        sessions_seen.add(sess)
+        msg_count += 1
+        if model in _NON_BILLABLE_MODELS:
+            # Harness-injected turn — zero tokens by definition; still count
+            # it toward newMessages/newSessions so totals stay consistent
+            # with stats-cache.json's own accounting.
+            continue
+        b = delta_by_model[model]
+        b["inputTokens"] += usage.get("input_tokens", 0)
+        b["outputTokens"] += usage.get("output_tokens", 0)
+        b["cacheReadInputTokens"] += usage.get("cache_read_input_tokens", 0)
+        b["cacheCreationInputTokens"] += usage.get("cache_creation_input_tokens", 0)
+        if date:
+            delta_daily[date][model] += (
+                usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            )
+    return {
+        "modelUsage": {m: dict(v) for m, v in delta_by_model.items()},
+        "dailyModelTokens": [
+            {"date": d, "tokensByModel": dict(v)}
+            for d, v in sorted(delta_daily.items())
+        ],
+        "newSessions": len(sessions_seen),
+        "newMessages": msg_count,
+    }
+
+
+def compute_costs(stats: dict[str, Any]) -> dict[str, Any]:
+    """Roll the per-model token counts into USD estimates.
+
+    Per-model and grand totals are computed exactly from
+    ``stats['modelUsage']`` (which has the full input/output/cacheRead/
+    cacheCreate breakdown). Per-day and per-month costs are approximated
+    by allocating the daily ``input+output`` total at each model's
+    **effective $/IO-token** rate — i.e. ``model_cost / (in+out)`` taken
+    from the all-time numbers. That way the cache portion is implicitly
+    pro-rated across the days that produced it (which is the best we can
+    do given the cache only stores per-day in+out tokens per model, not
+    a full token-class breakdown). Sum of daily ≈ total.
+    """
+    cost_by_model: dict[str, float] = {}
+    effective_per_io_token: dict[str, float] = {}
+    missing: list[str] = []
+    total_cost = 0.0
+    for mid, usage in (stats.get("modelUsage") or {}).items():
+        if not model_price(mid):
+            if mid:
+                missing.append(mid)
+            continue
+        c = model_cost(mid, usage)
+        cost_by_model[mid] = c
+        total_cost += c
+        io = (usage.get("inputTokens", 0) or 0) + (usage.get("outputTokens", 0) or 0)
+        if io > 0:
+            effective_per_io_token[mid] = c / io
+
+    daily_cost: list[dict[str, Any]] = []
+    for d in stats.get("dailyModelTokens") or []:
+        c = 0.0
+        for mid, toks in (d.get("tokensByModel") or {}).items():
+            rate = effective_per_io_token.get(mid)
+            if rate is None:
+                continue
+            c += toks * rate
+        daily_cost.append({"date": d.get("date", ""), "cost": c})
+
+    monthly_cost: dict[str, float] = defaultdict(float)
+    for entry in daily_cost:
+        month = (entry.get("date") or "")[:7]
+        if month:
+            monthly_cost[month] += entry["cost"]
+
+    return {
+        "totalCost": total_cost,
+        "costByModel": cost_by_model,
+        "dailyCost": daily_cost,
+        "monthlyCost": dict(monthly_cost),
+        "effectivePerIoToken": effective_per_io_token,
+        "missingModels": sorted(set(missing)),
+        "source": PRICING_SOURCE,
+        "fetchedOn": PRICING_FETCHED_ON,
+        "cacheWriteAssumption": "5min TTL",
+    }
 
 
 _LANG_BY_EXT: dict[str, str] = {
@@ -850,7 +1089,7 @@ def _extract_chunk(
 def extract_themes(
     queries: list[str],
     claude_bin: str | None,
-    chunks: int = 4,
+    chunks: int = 10,
 ) -> list[dict[str, Any]] | None:
     """Cluster WebSearch queries via 4 parallel ``claude -p`` calls.
 
@@ -886,7 +1125,13 @@ def extract_themes(
     return all_themes
 
 
-_CLASSIFICATION_CATEGORIES: list[str] = [
+# Static fallback categories — used ONLY when (a) the user explicitly
+# disables AI via --no-ai, or (b) no `claude` CLI is on PATH, or (c) the
+# discovery call fails. These are intentionally generic to coding work, not
+# to any particular stack or audience. The default path discovers categories
+# from the user's actual data via Haiku, so these are never the user-facing
+# taxonomy unless one of those fallback conditions hits.
+_FALLBACK_CATEGORIES: tuple[str, ...] = (
     "Bug fix",
     "New feature",
     "Refactor",
@@ -897,46 +1142,113 @@ _CLASSIFICATION_CATEGORIES: list[str] = [
     "Testing",
     "Operations",
     "Other",
-]
+)
 
 
-_CLASSIFY_PROMPT_HEADER = textwrap.dedent("""\
-    You will be given a numbered list of first messages from coding sessions.
-    Classify each message into EXACTLY ONE of these categories:
-
-      Bug fix
-      New feature
-      Refactor
-      Question / Q&A
-      Exploration / Research
-      Documentation
-      Setup / Config
-      Testing
-      Operations
-      Other
+_DISCOVER_PROMPT = textwrap.dedent("""\
+    You are looking at first-messages from a coding-assistant user's sessions.
+    Your job is to PROPOSE a taxonomy of 8-12 SHORT CATEGORY LABELS that
+    together cover the messages below. The labels will be used to classify
+    every session's first message; one label per session.
 
     Output JSON ONLY. No prose. No markdown fences. Schema:
-      {"results": [{"i": <int>, "c": "<category>"}]}
+      {"categories": ["<label1>", "<label2>", ...]}
 
     Rules:
-      - i is the message number as given.
-      - c MUST be one of the categories above, spelled exactly.
-      - One result per input message.
-      - If the message is a slash command (starts with /), classify by what the
-        command name implies (e.g. /review → Question / Q&A, /init → Setup / Config).
+      - Labels are short noun phrases (1-4 words), title-cased.
+      - Aim for 8-12 categories.
+      - Include 'Other' as the final fallback for messages that fit nothing.
+      - Labels should be distinct from each other; no near-duplicates.
+      - Pick labels that match THIS user's actual work, not generic ones.
+        Example: if many messages are about Rust ECS, "Rust ECS" is a fine
+        label; if many are about Databricks pipelines, "Databricks Pipelines"
+        is fine.
 
-    Messages:
+    Messages (representative sample):
     """)
+
+
+def discover_topic_categories(
+    sessions: list[dict[str, Any]],
+    claude_bin: str,
+    sample_size: int = 40,
+    timeout: int = 120,
+) -> list[str] | None:
+    """Sample session first-prompts and let Haiku propose a taxonomy.
+
+    Returns ``None`` if the discovery call fails — caller falls back to
+    ``_FALLBACK_CATEGORIES``.
+    """
+    prompts = [s.get("prompt") or "" for s in sessions if (s.get("prompt") or "").strip()]
+    if not prompts:
+        return None
+    # Sample deterministically (evenly spaced) so a re-run produces the same
+    # sample. Random sampling would make categories non-deterministic across
+    # runs which makes tracking trends harder.
+    n = min(sample_size, len(prompts))
+    if n == 0:
+        return None
+    step = max(1, len(prompts) // n)
+    sample = prompts[::step][:n]
+    body = "\n".join(f"- {p[:300].replace(chr(10), ' ').strip()}" for p in sample)
+    prompt = _DISCOVER_PROMPT + body
+    try:
+        result = subprocess.run(
+            [claude_bin, "-p", prompt, "--model", "haiku", "--output-format", "text"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(f"  [warn] discover_topic_categories failed: {exc}", file=sys.stderr)
+        return None
+    out = (result.stdout or "").strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```(?:json)?\s*", "", out)
+        out = re.sub(r"\s*```\s*$", "", out)
+    brace = out.find("{")
+    if brace > 0:
+        out = out[brace:]
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    cats = parsed.get("categories")
+    if not isinstance(cats, list):
+        return None
+    cleaned = [c.strip() for c in cats if isinstance(c, str) and c.strip()]
+    # Always make sure 'Other' is present so the classifier has a fallback bucket.
+    if not any(c.lower() == "other" for c in cleaned):
+        cleaned.append("Other")
+    return cleaned[:12] if cleaned else None
 
 
 def _classify_chunk(
     chunk: list[tuple[int, str]],
     claude_bin: str,
+    categories: list[str],
     timeout: int = 120,
 ) -> dict[int, str]:
     """Run one ``claude -p`` call over a batch of (index, text) pairs."""
+    cat_block = "\n".join(f"      {c}" for c in categories)
+    prompt_header = textwrap.dedent("""\
+        You will be given a numbered list of first messages from coding sessions.
+        Classify each message into EXACTLY ONE of these categories:
+
+        """) + cat_block + textwrap.dedent("""\
+
+        Output JSON ONLY. No prose. No markdown fences. Schema:
+          {"results": [{"i": <int>, "c": "<category>"}]}
+
+        Rules:
+          - i is the message number as given.
+          - c MUST be one of the categories above, spelled exactly.
+          - One result per input message.
+          - If the message is a slash command (starts with /), classify by what
+            the command name implies.
+
+        Messages:
+        """)
     body = "\n".join(f"{i}. {text[:300].replace(chr(10), ' ').strip()}" for i, text in chunk)
-    prompt = _CLASSIFY_PROMPT_HEADER + body
+    prompt = prompt_header + body
     try:
         result = subprocess.run(
             [claude_bin, "-p", prompt, "--model", "haiku", "--output-format", "text"],
@@ -959,7 +1271,8 @@ def _classify_chunk(
     results = parsed.get("results")
     if not isinstance(results, list):
         return {}
-    valid = set(_CLASSIFICATION_CATEGORIES)
+    valid = set(categories)
+    other_label = next((c for c in categories if c.lower() == "other"), "Other")
     mapping: dict[int, str] = {}
     for r in results:
         if not isinstance(r, dict):
@@ -970,7 +1283,7 @@ def _classify_chunk(
             continue
         c = (r.get("c") or "").strip()
         if c not in valid:
-            c = "Other"
+            c = other_label
         mapping[i] = c
     return mapping
 
@@ -978,16 +1291,17 @@ def _classify_chunk(
 def classify_sessions(
     sessions: list[dict[str, Any]],
     claude_bin: str | None,
+    categories: list[str],
     chunk_size: int = 60,
-    max_workers: int = 10,
+    max_workers: int = 20,
 ) -> list[str]:
     """Classify each session's first prompt via parallel Haiku calls.
 
-    Returns a list aligned with ``sessions`` mapping each to a category from
-    ``_CLASSIFICATION_CATEGORIES`` (or ``"(unclassified)"`` if Haiku failed).
+    Returns a list aligned with ``sessions`` mapping each session to one of the
+    given ``categories`` (or ``"(unclassified)"`` if Haiku failed).
     """
     out: list[str] = ["(unclassified)"] * len(sessions)
-    if not claude_bin or not sessions:
+    if not claude_bin or not sessions or not categories:
         return out
 
     indexed: list[tuple[int, str]] = [
@@ -1004,7 +1318,7 @@ def classify_sessions(
     )
 
     with cf.ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as ex:
-        futures = [ex.submit(_classify_chunk, c, claude_bin) for c in chunks]
+        futures = [ex.submit(_classify_chunk, c, claude_bin, categories) for c in chunks]
         for fut in cf.as_completed(futures):
             for i, cat in fut.result().items():
                 if 0 <= i < len(out):
@@ -1054,6 +1368,10 @@ def render_html(
     sessions: list[dict[str, Any]],
     dims: dict[str, list[str]],
     generated_at: str,
+    last_computed_date: str = "",
+    delta_last_date: str = "",
+    delta_new_sessions: int = 0,
+    costs: dict[str, Any] | None = None,
 ) -> str:
     """Render ``HTML_TEMPLATE`` with the prepared payloads.
 
@@ -1087,6 +1405,13 @@ def render_html(
             sk and sk not in _SLASH_BUILTINS for sk in dims.get("skills", [])
         ),
         generated_at=generated_at,
+        last_computed_date=last_computed_date,
+        delta_last_date=delta_last_date,
+        delta_new_sessions=delta_new_sessions,
+        costs_json=json.dumps(costs or {}, default=str),
+        pricing_source=(costs or {}).get("source", ""),
+        pricing_fetched_on=(costs or {}).get("fetchedOn", ""),
+        cost_missing_models=(costs or {}).get("missingModels", []),
     )
 
 
@@ -1120,6 +1445,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--title", type=str, default="Claude Code · Usage",
         help='Header title (default: "Claude Code · Usage").',
+    )
+    p.add_argument(
+        "--topics", type=str, default=None,
+        help=(
+            "Comma-separated list of classification categories for the "
+            '"What you worked on" section. Overrides the AI-discovered '
+            "taxonomy. Example: --topics \"Bug fix,New feature,Refactor,Other\"."
+        ),
     )
     args = p.parse_args(argv)
 
@@ -1166,6 +1499,70 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
+    # --- Live delta: extend the cache with today + any post-cache days ---
+    # stats-cache.json only refreshes when /usage is opened in the "all" tab
+    # AND covers data through lastComputedDate (typically yesterday). Walk
+    # the JSONL tail and add a delta so the dashboard isn't stale.
+    last_computed_date = stats.get("lastComputedDate") or ""
+    print(
+        f"Computing live delta after {last_computed_date or '(no cache date)'}…",
+        file=sys.stderr,
+    )
+    delta = compute_live_delta(claude_dir, last_computed_date or None)
+    for m, v in delta["modelUsage"].items():
+        base = stats["modelUsage"].setdefault(m, {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+        })
+        for k in (
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        ):
+            base[k] = base.get(k, 0) + v[k]
+    existing_dates = {d["date"] for d in stats["dailyModelTokens"]}
+    for entry in delta["dailyModelTokens"]:
+        if entry["date"] not in existing_dates:
+            stats["dailyModelTokens"].append(entry)
+    stats["dailyModelTokens"].sort(key=lambda d: d["date"])
+    stats["totalSessions"] = stats.get("totalSessions", 0) + delta["newSessions"]
+    stats["totalMessages"] = stats.get("totalMessages", 0) + delta["newMessages"]
+    monthly_rebuilt: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+    for d in stats["dailyModelTokens"]:
+        month = d["date"][:7]
+        for m, t in d.get("tokensByModel", {}).items():
+            monthly_rebuilt[month][m] += t
+    stats["monthlyIO"] = {m: dict(v) for m, v in monthly_rebuilt.items()}
+    delta_last_date = (
+        delta["dailyModelTokens"][-1]["date"] if delta["dailyModelTokens"] else ""
+    )
+    if delta_last_date:
+        stats["liveLastDate"] = delta_last_date
+    print(
+        f"  → live delta: +{delta['newMessages']} messages, "
+        f"+{delta['newSessions']} sessions, "
+        f"{len(delta['dailyModelTokens'])} new daily rows "
+        f"(through {delta_last_date or '—'}).",
+        file=sys.stderr,
+    )
+
+    costs = compute_costs(stats)
+    print(
+        f"Estimated cost: ${costs['totalCost']:,.2f} across {len(costs['costByModel'])} priced model(s)"
+        + (
+            f"; unpriced models skipped: {', '.join(costs['missingModels'])}"
+            if costs["missingModels"]
+            else ""
+        )
+        + ".",
+        file=sys.stderr,
+    )
+
     wordcloud: list[dict[str, Any]] | None = None
     if args.no_ai:
         print("Skipping AI theme extraction (--no-ai).", file=sys.stderr)
@@ -1204,8 +1601,40 @@ def main(argv: list[str] | None = None) -> int:
         if not claude_bin:
             pass  # warning already printed for themes step
         else:
+            # Decide the taxonomy: explicit --topics > AI-discovered from this
+            # user's data > static fallback. The default path is discovery,
+            # which makes the dashboard portable: a Rust dev sees Rust-flavored
+            # categories, a Databricks dev sees Databricks-flavored ones.
+            if args.topics:
+                categories = [
+                    s.strip() for s in args.topics.split(",") if s.strip()
+                ]
+                if not any(c.lower() == "other" for c in categories):
+                    categories.append("Other")
+                print(
+                    f"Using {len(categories)} user-supplied topic categories: "
+                    f"{', '.join(categories)}",
+                    file=sys.stderr,
+                )
+            else:
+                print("Discovering topic categories from session sample…", file=sys.stderr)
+                discovered = discover_topic_categories(sessions_rows, claude_bin)
+                if discovered:
+                    categories = discovered
+                    print(
+                        f"  → discovered {len(categories)} categories: "
+                        f"{', '.join(categories)}",
+                        file=sys.stderr,
+                    )
+                else:
+                    categories = list(_FALLBACK_CATEGORIES)
+                    print(
+                        f"  [warn] discovery failed — using static fallback "
+                        f"({len(categories)} categories).",
+                        file=sys.stderr,
+                    )
             print("Classifying session first-prompts via Haiku…", file=sys.stderr)
-            cats = classify_sessions(sessions_rows, claude_bin)
+            cats = classify_sessions(sessions_rows, claude_bin, categories)
             cls_idx_map: dict[str, int] = {
                 name: i for i, name in enumerate(dims["classifications"])
             }
@@ -1235,6 +1664,10 @@ def main(argv: list[str] | None = None) -> int:
         sessions=sessions_rows,
         dims=dims,
         generated_at=datetime.now().isoformat(timespec="seconds"),
+        last_computed_date=last_computed_date,
+        delta_last_date=delta_last_date,
+        delta_new_sessions=delta["newSessions"],
+        costs=costs,
     )
 
     out_path = args.output.expanduser().resolve()
@@ -1330,9 +1763,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     .container { max-width: 1280px; margin: 0 auto; padding: 16px 36px 80px; }
     .grid { display: grid; gap: 16px; }
     .grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+    .grid.cols-5 { grid-template-columns: repeat(5, 1fr); }
     .grid.cols-2 { grid-template-columns: 1.1fr 0.9fr; }
+    @media (max-width: 1200px) {
+      .grid.cols-5 { grid-template-columns: repeat(3, 1fr); }
+    }
     @media (max-width: 1020px) {
       .grid.cols-4 { grid-template-columns: repeat(2, 1fr); }
+      .grid.cols-5 { grid-template-columns: repeat(2, 1fr); }
       .grid.cols-2 { grid-template-columns: 1fr; }
     }
     .card {
@@ -1611,18 +2049,21 @@ HTML_TEMPLATE = r"""<!doctype html>
   <div class="eyebrow">Local data · stats-cache.json</div>
   <h1>Your token <em>universe</em>, visualized.</h1>
   <p>A dashboard drawn entirely from <span class="source-pill">~/.claude/stats-cache.json</span> and your local
-    transcripts. Token totals include input, output, cache reads and cache writes — the full picture, not just
-    the input+output figure shown in <span class="source-pill">/usage</span>.
+    transcripts.
     <span class="filter-warn hidden" id="filterWarn">Filtered view</span></p>
 </section>
 
 <main class="container">
 
   <!-- KPI cards -->
-  <div class="grid cols-4">
+  <div class="grid cols-5">
     <div class="card"><h3>Total tokens</h3><p class="sub">All classes incl. cache</p>
       <div class="big" id="kpiTokens">—</div>
       <div class="delta" id="kpiTokensDelta">—</div>
+    </div>
+    <div class="card"><h3>Estimated cost</h3><p class="sub">At list API prices · see source note</p>
+      <div class="big" id="kpiCost">—</div>
+      <div class="delta" id="kpiCostDelta">—</div>
     </div>
     <div class="card"><h3>Sessions</h3><p class="sub">Distinct Claude Code sessions</p>
       <div class="big" id="kpiSessions">—</div>
@@ -1643,7 +2084,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="chart-head">
       <div>
         <div class="chart-title">Daily input + output by model</div>
-        <div class="chart-sub">Cache tokens are not stored per-day in this cache — see model breakdown below for the full picture.</div>
+        <div class="chart-sub">Hover for estimated $ cost per day. Cache tokens are not stored per-day in this cache — see model breakdown below for the full picture.</div>
       </div>
     </div>
     <div class="chart-wrap tall"><canvas id="dailyChart"></canvas></div>
@@ -1676,7 +2117,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="chart-head">
       <div>
         <div class="chart-title">Monthly input + output tokens, by model</div>
-        <div class="chart-sub">Note: this is the only per-month breakdown available in stats-cache (cache tokens are aggregate-only).</div>
+        <div class="chart-sub">Right axis: estimated $ cost per month (brown line). Note: this is the only per-month breakdown available in stats-cache (cache tokens are aggregate-only).</div>
       </div>
     </div>
     <div class="chart-wrap"><canvas id="monthlyChart"></canvas></div>
@@ -1936,6 +2377,20 @@ HTML_TEMPLATE = r"""<!doctype html>
     Per-day model tokens cover input+output only; full token-class breakdown is available as an all-time total per model.
     For numbers your finance team can reconcile against an Anthropic invoice, use the Admin API
     (<code>/v1/organizations/usage_report/claude_code</code>) — only that source ties out to billing.
+    <div style="margin-top:8px;">
+      <strong>Cost estimate:</strong> rates pulled from
+      <a href="{{ pricing_source }}" target="_blank" rel="noopener" style="color:var(--coral-2);">{{ pricing_source }}</a>
+      on <code>{{ pricing_fetched_on }}</code>. Cache writes assume the 5-minute TTL (Claude Code default; 1-hour TTL would be ≈60% higher per cache-write token). Per-day and per-month costs apply each model's all-time effective $ / IO-token rate, so the cache portion is pro-rated across days. Per-model totals and the KPI card use the exact per-class breakdown.
+      {% if cost_missing_models %}
+      Models without a known price (skipped from cost totals): <code>{{ cost_missing_models|join(', ') }}</code>.
+      {% endif %}
+    </div>
+    {% if delta_last_date %}
+    <div style="margin-top:8px;">
+      Cache last refreshed by Claude Code: <code>{{ last_computed_date or '—' }}</code> · supplemented with
+      live transcripts through <code>{{ delta_last_date }}</code> ({{ delta_new_sessions }} new session{{ '' if delta_new_sessions == 1 else 's' }}).
+    </div>
+    {% endif %}
   </div>
 
 </main>
@@ -1956,6 +2411,18 @@ const TOTAL_TOOL_CALLS = {{ total_tool_calls }};
 const EVENTS = {{ events_json|safe }};
 const SESSIONS = {{ sessions_json|safe }};
 const DIMS = {{ dims_json|safe }};
+const COSTS = {{ costs_json|safe }};
+const COST_EFF = (COSTS && COSTS.effectivePerIoToken) || {};
+function fmtUsd(x) {
+  if (!isFinite(x) || x === null || x === undefined) return '—';
+  if (x >= 100000) return '$' + Math.round(x).toLocaleString();
+  if (x >= 1000)   return '$' + x.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (x >= 100)    return '$' + x.toFixed(0);
+  if (x >= 10)     return '$' + x.toFixed(1);
+  if (x >= 1)      return '$' + x.toFixed(2);
+  if (x > 0)       return '$' + x.toFixed(3);
+  return '$0.00';
+}
 
 // ============== HELPERS ==============
 const fmt = n => new Intl.NumberFormat('en-US').format(Math.round(n));
@@ -2166,6 +2633,32 @@ function renderTopKPIs() {
     `${compact(tokensTotalDisplay)}<small>${fmt(tokensTotalDisplay)} total</small>`;
   document.getElementById('kpiTokensDelta').textContent = tokensSubtitle;
 
+  // --- Estimated cost card ---
+  // Filtered view: apply each model's effective $/IO-token to clipped daily
+  // totals (the only per-day numbers available). Unfiltered: use the exact
+  // per-class total computed server-side. The two paths agree at full range.
+  let costDisplay, costSubtitle;
+  if (filtersActive()) {
+    let costFiltered = 0;
+    for (const d of dailyClipped) {
+      for (const [m, v] of Object.entries(d.tokensByModel || {})) {
+        const rate = COST_EFF[m];
+        if (rate) costFiltered += v * rate;
+      }
+    }
+    costDisplay = costFiltered;
+    costSubtitle = 'in this filtered view';
+  } else {
+    costDisplay = (COSTS && COSTS.totalCost) || 0;
+    const missing = (COSTS && COSTS.missingModels) || [];
+    costSubtitle = missing.length
+      ? `unpriced models skipped: ${missing.map(shortOf).join(', ')}`
+      : 'list API prices, all models priced';
+  }
+  document.getElementById('kpiCost').innerHTML =
+    `${fmtUsd(costDisplay)}<small>${COSTS && COSTS.cacheWriteAssumption ? 'assumes ' + COSTS.cacheWriteAssumption + ' cache' : ''}</small>`;
+  document.getElementById('kpiCostDelta').textContent = costSubtitle;
+
   // Sessions / Messages / Active days — filterable derived from SESSIONS + filteredEvents.
   let filteredSessions = SESSIONS.filter(sessionMatches);
   if (filtersActive()) {
@@ -2259,7 +2752,27 @@ function renderDailyChart(dailyClipped) {
       },
       plugins: {
         legend: { position: 'bottom' },
-        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens` } },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const mid = orderedModels[ctx.datasetIndex];
+              const rate = COST_EFF[mid];
+              const cost = rate ? ctx.raw * rate : null;
+              return cost !== null
+                ? `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens · ${fmtUsd(cost)}`
+                : `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens`;
+            },
+            footer: items => {
+              let total = 0;
+              for (const it of items) {
+                const mid = orderedModels[it.datasetIndex];
+                const rate = COST_EFF[mid];
+                if (rate) total += it.raw * rate;
+              }
+              return total > 0 ? `Estimated cost: ${fmtUsd(total)}` : '';
+            },
+          },
+        },
       },
     },
   });
@@ -2376,18 +2889,71 @@ function renderMonthly(dailyClipped) {
     backgroundColor: colorOf(model),
     borderWidth: 0, borderRadius: 4, stack: 's',
   }));
+  // Build an overlay line of estimated $ cost per month (right axis).
+  const monthlyCost = months.map(month => {
+    let c = 0;
+    for (const [mid, v] of Object.entries(byMonth[month])) {
+      const rate = COST_EFF[mid];
+      if (rate) c += v * rate;
+    }
+    return c;
+  });
+  const costLine = {
+    type: 'line',
+    label: 'Estimated cost (USD)',
+    data: monthlyCost,
+    yAxisID: 'yCost',
+    borderColor: '#7A4F37',
+    backgroundColor: '#7A4F37',
+    borderWidth: 2,
+    tension: 0.25,
+    pointRadius: 3,
+    pointHoverRadius: 5,
+    stack: 'cost',
+  };
   charts.monthly = new Chart(document.getElementById('monthlyChart'), {
     type: 'bar',
-    data: { labels: months, datasets },
+    data: { labels: months, datasets: [...datasets, costLine] },
     options: {
       responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
       scales: {
         x: { stacked: true, grid: { display: false } },
         y: { stacked: true, grid: { color: '#EDE9DC' }, ticks: { callback: v => compact(v) } },
+        yCost: {
+          position: 'right', stacked: false,
+          grid: { display: false },
+          ticks: { callback: v => fmtUsd(v) },
+          title: { display: true, text: 'USD', color: '#7A4F37', font: { size: 11 } },
+        },
       },
       plugins: {
         legend: { position: 'bottom' },
-        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens` } },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              if (ctx.dataset.yAxisID === 'yCost') {
+                return `${ctx.dataset.label}: ${fmtUsd(ctx.raw)}`;
+              }
+              const mid = orderedModels[ctx.datasetIndex];
+              const rate = COST_EFF[mid];
+              const cost = rate ? ctx.raw * rate : null;
+              return cost !== null
+                ? `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens · ${fmtUsd(cost)}`
+                : `${ctx.dataset.label}: ${fmt(ctx.raw)} tokens`;
+            },
+            footer: items => {
+              let total = 0;
+              for (const it of items) {
+                if (it.dataset.yAxisID === 'yCost') continue;
+                const mid = orderedModels[it.datasetIndex];
+                const rate = COST_EFF[mid];
+                if (rate) total += it.raw * rate;
+              }
+              return total > 0 ? `Estimated total: ${fmtUsd(total)}` : '';
+            },
+          },
+        },
       },
     },
   });
