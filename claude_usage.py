@@ -1044,7 +1044,7 @@ def classify_sessions(
     sessions: list[dict[str, Any]],
     claude_bin: str | None,
     chunk_size: int = 60,
-    max_workers: int = 4,
+    max_workers: int = 10,
 ) -> list[str]:
     """Classify each session's first prompt via parallel Haiku calls.
 
