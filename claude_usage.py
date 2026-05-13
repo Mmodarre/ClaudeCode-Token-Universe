@@ -1138,6 +1138,10 @@ def render_html(
         dims_json=json.dumps(dims, default=str, separators=(",", ":")),
         total_tool_calls=total_tool_calls,
         websearch_count=research["websearchTotal"],
+        # Hide the Topics section if classification didn't run (e.g., --no-ai
+        # or no claude CLI). dims.classifications always starts with the
+        # placeholder "(unclassified)"; real categories appear after that.
+        has_classifications=len(dims.get("classifications", [])) > 1,
         generated_at=generated_at,
     )
 
@@ -1764,6 +1768,37 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div class="chart-wrap"><canvas id="hourChart"></canvas></div>
     </div>
   </div>
+
+  {% if has_classifications %}
+  <h2 class="section-title">What you worked on</h2>
+  <div class="grid cols-4" style="margin-bottom:16px">
+    <div class="card"><h3>Sessions classified</h3><p class="sub">First-prompt → Haiku</p>
+      <div class="big" id="topicSessions">—</div>
+      <div class="delta" id="topicSessionsDelta">—</div>
+    </div>
+    <div class="card"><h3>Dominant topic</h3><p class="sub">Most-frequent category</p>
+      <div class="big" id="topicTop" style="font-size:24px;">—</div>
+      <div class="delta" id="topicTopDelta">—</div>
+    </div>
+    <div class="card"><h3>Unique topics</h3><p class="sub">Active categories in view</p>
+      <div class="big" id="topicCount">—</div>
+      <div class="delta" id="topicCountDelta">—</div>
+    </div>
+    <div class="card"><h3>Unclassified</h3><p class="sub">First prompt empty or unreadable</p>
+      <div class="big" id="topicUnc">—</div>
+      <div class="delta" id="topicUncDelta">—</div>
+    </div>
+  </div>
+  <div class="card chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">Sessions and tool calls by topic</div>
+        <div class="chart-sub">Each session's first prompt classified by Haiku into one of 10 buckets · chart ignores the topic filter so the distribution stays visible while you slice</div>
+      </div>
+    </div>
+    <div class="chart-wrap tall" style="height:380px"><canvas id="topicChart"></canvas></div>
+  </div>
+  {% endif %}
 
   {% if mcp_present %}
   <h2 class="section-title">{{ mcp_display_name }} MCP</h2>
@@ -2668,6 +2703,129 @@ function renderWordcloud() {
   }
 }
 
+// ============== Topics (Haiku-classified first prompts) ==============
+// Like eventMatches but ignores the classification filter — the topics chart
+// shows the distribution under all OTHER filters, so users can see how
+// projects/dates/etc. shift the topic mix.
+function eventMatchesIgnoreClass(ev) {
+  if (ev[0] < state.dateMin || ev[0] > state.dateMax) return false;
+  if (state.models.size   && !state.models.has(ev[2]))   return false;
+  if (state.projects.size && !state.projects.has(ev[1])) return false;
+  if (state.servers.size  && !state.servers.has(ev[3]))  return false;
+  if (state.skills.size   && !state.skills.has(ev[5]))   return false;
+  return true;
+}
+function sessionMatchesIgnoreClass(s) {
+  if (s.start) {
+    const di = DATES_INDEX.get(s.start);
+    if (di !== undefined && (di < state.dateMin || di > state.dateMax)) return false;
+  }
+  if (state.projects.size && !state.projects.has(s.proj)) return false;
+  return true;
+}
+
+function aggregateTopics() {
+  const sessionsByTopic = {};
+  const eventsByTopic = {};
+  for (const s of SESSIONS) {
+    if (!sessionMatchesIgnoreClass(s)) continue;
+    const t = DIMS.classifications[s.cls] || '(unclassified)';
+    sessionsByTopic[t] = (sessionsByTopic[t] || 0) + 1;
+  }
+  for (const ev of EVENTS) {
+    if (!eventMatchesIgnoreClass(ev)) continue;
+    const t = DIMS.classifications[sessCls[ev[8]] || 0] || '(unclassified)';
+    eventsByTopic[t] = (eventsByTopic[t] || 0) + 1;
+  }
+  return { sessionsByTopic, eventsByTopic };
+}
+
+function renderTopics() {
+  if (!document.getElementById('topicChart')) return;   // section hidden
+  destroyChart('topicChart');
+  const { sessionsByTopic, eventsByTopic } = aggregateTopics();
+  const all = new Set([...Object.keys(sessionsByTopic), ...Object.keys(eventsByTopic)]);
+  all.delete('(unclassified)');
+  const rows = [...all].map(t => ({
+    topic: t,
+    sessions: sessionsByTopic[t] || 0,
+    events: eventsByTopic[t] || 0,
+  })).sort((a, b) => b.sessions - a.sessions);
+
+  const classifiedSessions = rows.reduce((s, r) => s + r.sessions, 0);
+  const unc = sessionsByTopic['(unclassified)'] || 0;
+  const totalSessionsInView = classifiedSessions + unc;
+
+  document.getElementById('topicSessions').textContent = fmt(classifiedSessions);
+  document.getElementById('topicSessionsDelta').textContent =
+    `of ${fmt(totalSessionsInView)} sessions in view`;
+  if (rows.length) {
+    document.getElementById('topicTop').textContent = rows[0].topic;
+    document.getElementById('topicTopDelta').textContent = classifiedSessions > 0
+      ? `${fmt(rows[0].sessions)} sessions (${(rows[0].sessions/classifiedSessions*100).toFixed(0)}%)`
+      : '—';
+  } else {
+    document.getElementById('topicTop').textContent = '—';
+    document.getElementById('topicTopDelta').textContent = '';
+  }
+  document.getElementById('topicCount').textContent = String(rows.length);
+  const totalCats = (DIMS.classifications.length - 1);
+  document.getElementById('topicCountDelta').textContent = `of ${totalCats} categories`;
+  document.getElementById('topicUnc').textContent = fmt(unc);
+  document.getElementById('topicUncDelta').textContent = totalSessionsInView > 0
+    ? `${(unc/totalSessionsInView*100).toFixed(0)}% of sessions in view`
+    : '—';
+
+  if (!rows.length) return;
+  const labels = rows.map(r => r.topic);
+  charts.topicChart = new Chart(document.getElementById('topicChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        // Sessions and tool-call counts differ by ~30× so they share a Y axis
+        // but use independent X scales — otherwise the session bars vanish
+        // beside the tool-call bars.
+        { label: 'Sessions',   data: rows.map(r => r.sessions), xAxisID: 'xSessions', backgroundColor: '#CC785C', borderWidth: 0, borderRadius: 3 },
+        { label: 'Tool calls', data: rows.map(r => r.events),   xAxisID: 'xCalls',    backgroundColor: '#7A4F37', borderWidth: 0, borderRadius: 3 },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        xSessions: {
+          position: 'bottom',
+          grid: { display: false },
+          ticks: { callback: v => compact(v), color: '#CC785C' },
+          title: { display: true, text: 'Sessions', color: '#CC785C', font: { size: 11, weight: '600' } },
+        },
+        xCalls: {
+          position: 'top',
+          grid: { color: '#EDE9DC' },
+          ticks: { callback: v => compact(v), color: '#7A4F37' },
+          title: { display: true, text: 'Tool calls', color: '#7A4F37', font: { size: 11, weight: '600' } },
+        },
+        y: { grid: { display: false }, ticks: { font: { size: 12 } } },
+      },
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)}`,
+            afterBody: items => {
+              const row = rows[items[0].dataIndex];
+              const ratio = row.sessions > 0 ? (row.events/row.sessions).toFixed(1) : '—';
+              return `${ratio} tool calls per session`;
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
 // ============== Programming languages ==============
 function aggregateLangsFromEvents(filteredEvents) {
   const reads = {}, edits = {};
@@ -2829,6 +2987,7 @@ function applyFilters() {
   // 5) MCP / Research / Languages from EVENTS.
   renderMCP(aggregateMCPFromEvents(filteredEvents), filteredEvents.length);
   renderResearch(aggregateResearchFromEvents(filteredEvents), filteredEvents.length);
+  renderTopics();
   renderLangs(aggregateLangsFromEvents(filteredEvents));
 
   // 6) Model breakdown table.
