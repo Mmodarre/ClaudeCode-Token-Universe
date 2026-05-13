@@ -440,6 +440,388 @@ def walk_transcripts(
     return mcp_block, research, queries, langs, total_tool_calls
 
 
+# --------------------------------------------------------------------------- #
+# Row-level events + sessions (for in-browser filtering)                      #
+# --------------------------------------------------------------------------- #
+
+_COMMAND_TAG_RE = re.compile(r"<command-name>\s*/?([\w\-:]+)\s*</command-name>", re.IGNORECASE)
+_SLASH_CMD_RE = re.compile(r"^/([\w\-:]+)\b")
+
+
+def _first_user_text(rec: dict) -> str:
+    """Pull the text out of a user record, ignoring tool_result blocks."""
+    msg = rec.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "text":
+                return blk.get("text") or ""
+    return ""
+
+
+def _detect_skill(text: str) -> str:
+    """Detect a skill / slash-command name from a user message body."""
+    if not text:
+        return ""
+    m = _COMMAND_TAG_RE.search(text)
+    if m:
+        return m.group(1).strip().lower()
+    head = text.strip().split("\n", 1)[0]
+    m2 = _SLASH_CMD_RE.match(head)
+    if m2:
+        return m2.group(1).strip().lower()
+    return ""
+
+
+def walk_with_events(
+    claude_dir: Path,
+    mcp_servers_filter: list[str] | None,
+) -> dict[str, Any]:
+    """Single pass over ``projects/**/*.jsonl`` returning rich row-level data.
+
+    Returns a dict with the same keys ``walk_transcripts`` returns *plus*:
+
+      events   — list of ``[dayIdx, projIdx, modelIdx, serverIdx, toolIdx,
+                 skillIdx, langReadIdx, langEditIdx, sessIdx, kind]``
+                 ``kind`` encodes the event family:
+                   0 = generic, 1 = MCP, 2 = WebFetch, 3 = WebSearch,
+                   4 = research-expert subagent, 5 = Read, 6 = Edit/Write.
+      sessions — list of ``{id, proj, start, prompt}`` (one row per JSONL).
+      dims     — interned dimension arrays the browser uses to populate the
+                 filter dropdowns and to decode integer-encoded event rows.
+    """
+    # --- Interning helpers ----------------------------------------------------
+    dims: dict[str, list[str]] = {
+        "projects": [],
+        "models": [],
+        "servers": ["(none)"],
+        "tools": ["(none)"],
+        "skills": ["(none)"],
+        "langs": ["(none)"],
+        "dates": [],            # sorted at the end
+        "classifications": ["(unclassified)"],
+    }
+    idx_maps: dict[str, dict[str, int]] = {
+        "projects": {},
+        "models": {},
+        "servers": {"(none)": 0},
+        "tools": {"(none)": 0},
+        "skills": {"(none)": 0},
+        "langs": {"(none)": 0},
+    }
+
+    def intern(dim: str, key: str) -> int:
+        if not key:
+            return 0 if dim in idx_maps and "(none)" in idx_maps[dim] else -1
+        m = idx_maps[dim]
+        if key in m:
+            return m[key]
+        m[key] = len(dims[dim])
+        dims[dim].append(key)
+        return m[key]
+
+    # --- Aggregation state (mirrors walk_transcripts) ------------------------
+    mcp_by_server: dict[str, dict[str, Counter]] = defaultdict(
+        lambda: {"tools": Counter(), "daily": Counter()}
+    )
+    webfetch_total = 0
+    websearch_total = 0
+    research_total = 0
+    webfetch_by_day: Counter = Counter()
+    websearch_by_day: Counter = Counter()
+    research_by_day: Counter = Counter()
+    domain_counts: Counter = Counter()
+    queries: list[str] = []
+    keyword_counter: Counter = Counter()
+    total_tool_calls = 0
+    lang_reads: Counter = Counter()
+    lang_edits: Counter = Counter()
+    lang_unique_read: dict[str, set[str]] = defaultdict(set)
+    lang_unique_edit: dict[str, set[str]] = defaultdict(set)
+
+    READ_TOOLS = {"Read"}
+    EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+    events: list[list[int]] = []
+    sessions: list[dict[str, Any]] = []
+    seen_block_ids: set[str] = set()
+    dates_set: set[str] = set()
+
+    projects_root = claude_dir / "projects"
+    if not projects_root.exists():
+        # No transcripts — return empties.
+        return {
+            "mcp_block": None,
+            "research": _empty_research(),
+            "queries": [],
+            "langs": _empty_langs(),
+            "total_tool_calls": 0,
+            "events": [],
+            "sessions": [],
+            "dims": dims,
+        }
+
+    for jsonl in sorted(projects_root.glob("**/*.jsonl")):
+        session_id = jsonl.stem
+        proj_name: str | None = None
+        first_prompt: str = ""
+        start_date: str = ""
+        # Skills are inferred per-message; persist the most recent one for
+        # subsequent tool_use events in the same logical turn.
+        current_skill: str = ""
+
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    cwd = rec.get("cwd")
+                    if proj_name is None and isinstance(cwd, str) and cwd:
+                        proj_name = Path(cwd).name or "(unknown)"
+
+                    ts = rec.get("timestamp") or ""
+                    date = ts[:10] if isinstance(ts, str) else ""
+                    if date:
+                        dates_set.add(date)
+                        if not start_date:
+                            start_date = date
+
+                    rtype = rec.get("type")
+
+                    if rtype == "user":
+                        text = _first_user_text(rec)
+                        if text and not first_prompt:
+                            first_prompt = text[:400]
+                        skill_name = _detect_skill(text)
+                        if skill_name:
+                            current_skill = skill_name
+                        continue
+
+                    if rtype != "assistant":
+                        continue
+
+                    msg = rec.get("message") or {}
+                    model_raw = msg.get("model") or ""
+                    for block in msg.get("content") or []:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        bid = block.get("id")
+                        if bid:
+                            if bid in seen_block_ids:
+                                continue
+                            seen_block_ids.add(bid)
+
+                        name = block.get("name") or ""
+                        inp = block.get("input") or {}
+
+                        # ---- existing per-event aggregates ----
+                        total_tool_calls += 1
+                        server_name = ""
+                        mcp_tool_name = ""
+                        kind = 0
+                        lang_read = ""
+                        lang_edit = ""
+
+                        mmatch = _MCP_TOOL_RE.match(name)
+                        if mmatch:
+                            server_name, mcp_tool_name = mmatch.group(1), mmatch.group(2)
+                            mcp_by_server[server_name]["tools"][mcp_tool_name] += 1
+                            if date:
+                                mcp_by_server[server_name]["daily"][date] += 1
+                            kind = 1
+                        elif name == "WebFetch":
+                            webfetch_total += 1
+                            if date:
+                                webfetch_by_day[date] += 1
+                            url = inp.get("url") or ""
+                            if isinstance(url, str) and url:
+                                try:
+                                    netloc = urllib.parse.urlparse(url).netloc.lower()
+                                    if netloc.startswith("www."):
+                                        netloc = netloc[4:]
+                                    if netloc:
+                                        domain_counts[netloc] += 1
+                                except ValueError:
+                                    pass
+                            kind = 2
+                        elif name == "WebSearch":
+                            websearch_total += 1
+                            if date:
+                                websearch_by_day[date] += 1
+                            q = inp.get("query") or ""
+                            if isinstance(q, str) and q.strip():
+                                queries.append(q.strip())
+                                for word in re.findall(r"[A-Za-z][A-Za-z0-9_+]{2,}", q.lower()):
+                                    if word not in _STOPWORDS:
+                                        keyword_counter[word] += 1
+                            kind = 3
+                        elif name in ("Task", "Agent"):
+                            if (inp.get("subagent_type") or "") == "research-expert":
+                                research_total += 1
+                                if date:
+                                    research_by_day[date] += 1
+                                kind = 4
+                            else:
+                                continue   # uninteresting agent call
+                        elif name in READ_TOOLS:
+                            path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
+                            if path:
+                                lang_read = _lang_for(path)
+                                lang_reads[lang_read] += 1
+                                lang_unique_read[lang_read].add(path)
+                            kind = 5
+                        elif name in EDIT_TOOLS:
+                            path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
+                            if path:
+                                lang_edit = _lang_for(path)
+                                lang_edits[lang_edit] += 1
+                                lang_unique_edit[lang_edit].add(path)
+                            kind = 6
+                        else:
+                            # generic tool — still emit an event row so it can
+                            # be filtered by project/model/skill.
+                            kind = 0
+
+                        # ---- intern dimensions and emit a row ----
+                        if proj_name is None:
+                            proj_name = "(unknown)"
+                        proj_idx = intern("projects", proj_name)
+                        model_short = MODEL_SHORT.get(model_raw, model_raw or "(unknown)")
+                        model_idx = intern("models", model_short)
+                        server_idx = intern("servers", server_name) if server_name else 0
+                        tool_idx = intern("tools", mcp_tool_name) if mcp_tool_name else 0
+                        skill_idx = intern("skills", current_skill) if current_skill else 0
+                        lr_idx = intern("langs", lang_read) if lang_read else 0
+                        le_idx = intern("langs", lang_edit) if lang_edit else 0
+                        # day idx is finalized after the walk completes (we
+                        # sort the dates dimension); store the date string for
+                        # now in a parallel list, then translate.
+                        events.append([
+                            date,         # placeholder; index applied below
+                            proj_idx,
+                            model_idx,
+                            server_idx,
+                            tool_idx,
+                            skill_idx,
+                            lr_idx,
+                            le_idx,
+                            len(sessions),  # session row index (current file)
+                            kind,
+                        ])
+        except OSError:
+            continue
+
+        if proj_name is None:
+            proj_name = "(unknown)"
+        sess_proj_idx = intern("projects", proj_name)
+        sessions.append({
+            "id": session_id,
+            "proj": sess_proj_idx,
+            "start": start_date,
+            "prompt": first_prompt,
+            "cls": 0,  # classification fills in later
+        })
+
+    # --- Finalize date dimension and replace date strings with indices -------
+    dims["dates"] = sorted(dates_set)
+    date_idx: dict[str, int] = {d: i for i, d in enumerate(dims["dates"])}
+    for ev in events:
+        ev[0] = date_idx.get(ev[0], -1)
+
+    # --- MCP filtering / top-1 (matches existing semantics) ------------------
+    mcp_block: dict[str, Any] | None = None
+    if mcp_by_server:
+        if mcp_servers_filter:
+            wanted = [s.strip() for s in mcp_servers_filter if s.strip()]
+            chosen = next((s for s in wanted if s in mcp_by_server), None)
+        else:
+            chosen = max(
+                mcp_by_server.items(),
+                key=lambda kv: sum(kv[1]["tools"].values()),
+            )[0]
+        if chosen:
+            info = mcp_by_server[chosen]
+            tool_counts = dict(info["tools"])
+            daily = dict(info["daily"])
+            mcp_block = {
+                "name": chosen,
+                "displayName": chosen[:1].upper() + chosen[1:],
+                "totalCalls": sum(tool_counts.values()),
+                "distinctTools": len(tool_counts),
+                "toolCounts": tool_counts,
+                "dailyTotal": daily,
+            }
+
+    research = {
+        "webfetchTotal": webfetch_total,
+        "websearchTotal": websearch_total,
+        "researchTotal": research_total,
+        "uniqueDomains": len(domain_counts),
+        "uniqueQueries": len(set(queries)),
+        "domainCounts": dict(domain_counts.most_common(20)),
+        "queryKeywords": dict(keyword_counter.most_common(20)),
+        "webfetchByDay": dict(webfetch_by_day),
+        "websearchByDay": dict(websearch_by_day),
+        "researchByDay": dict(research_by_day),
+    }
+
+    # Languages payload (same shape as existing) ------------------------------
+    all_langs = set(lang_reads) | set(lang_edits)
+    rows = []
+    for lang in all_langs:
+        rows.append({
+            "lang": lang,
+            "reads": lang_reads.get(lang, 0),
+            "edits": lang_edits.get(lang, 0),
+            "uniqRead": len(lang_unique_read.get(lang, ())),
+            "uniqEdit": len(lang_unique_edit.get(lang, ())),
+        })
+    rows.sort(key=lambda r: r["reads"] + r["edits"], reverse=True)
+    langs = {
+        "totalReads": sum(lang_reads.values()),
+        "totalWrites": sum(lang_edits.values()),
+        "uniqueRead": sum(len(s) for s in lang_unique_read.values()),
+        "uniqueWrite": sum(len(s) for s in lang_unique_edit.values()),
+        "rows": rows,
+    }
+
+    return {
+        "mcp_block": mcp_block,
+        "research": research,
+        "queries": queries,
+        "langs": langs,
+        "total_tool_calls": total_tool_calls,
+        "events": events,
+        "sessions": sessions,
+        "dims": dims,
+    }
+
+
+def _empty_research() -> dict[str, Any]:
+    return {
+        "webfetchTotal": 0, "websearchTotal": 0, "researchTotal": 0,
+        "uniqueDomains": 0, "uniqueQueries": 0,
+        "domainCounts": {}, "queryKeywords": {},
+        "webfetchByDay": {}, "websearchByDay": {}, "researchByDay": {},
+    }
+
+
+def _empty_langs() -> dict[str, Any]:
+    return {"totalReads": 0, "totalWrites": 0, "uniqueRead": 0, "uniqueWrite": 0, "rows": []}
+
+
 # Small stopword set for keyword extraction — only used as a back-up signal
 # in the research payload; the real "what you researched" view is the AI
 # theme cloud. Kept short on purpose.
@@ -569,6 +951,132 @@ def extract_themes(
     return all_themes
 
 
+_CLASSIFICATION_CATEGORIES: list[str] = [
+    "Bug fix",
+    "New feature",
+    "Refactor",
+    "Question / Q&A",
+    "Exploration / Research",
+    "Documentation",
+    "Setup / Config",
+    "Testing",
+    "Operations",
+    "Other",
+]
+
+
+_CLASSIFY_PROMPT_HEADER = textwrap.dedent("""\
+    You will be given a numbered list of first messages from coding sessions.
+    Classify each message into EXACTLY ONE of these categories:
+
+      Bug fix
+      New feature
+      Refactor
+      Question / Q&A
+      Exploration / Research
+      Documentation
+      Setup / Config
+      Testing
+      Operations
+      Other
+
+    Output JSON ONLY. No prose. No markdown fences. Schema:
+      {"results": [{"i": <int>, "c": "<category>"}]}
+
+    Rules:
+      - i is the message number as given.
+      - c MUST be one of the categories above, spelled exactly.
+      - One result per input message.
+      - If the message is a slash command (starts with /), classify by what the
+        command name implies (e.g. /review → Question / Q&A, /init → Setup / Config).
+
+    Messages:
+    """)
+
+
+def _classify_chunk(
+    chunk: list[tuple[int, str]],
+    claude_bin: str,
+    timeout: int = 120,
+) -> dict[int, str]:
+    """Run one ``claude -p`` call over a batch of (index, text) pairs."""
+    body = "\n".join(f"{i}. {text[:300].replace(chr(10), ' ').strip()}" for i, text in chunk)
+    prompt = _CLASSIFY_PROMPT_HEADER + body
+    try:
+        result = subprocess.run(
+            [claude_bin, "-p", prompt, "--model", "haiku", "--output-format", "text"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(f"  [warn] classify chunk failed: {exc}", file=sys.stderr)
+        return {}
+    out = (result.stdout or "").strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```(?:json)?\s*", "", out)
+        out = re.sub(r"\s*```\s*$", "", out)
+    brace = out.find("{")
+    if brace > 0:
+        out = out[brace:]
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+    results = parsed.get("results")
+    if not isinstance(results, list):
+        return {}
+    valid = set(_CLASSIFICATION_CATEGORIES)
+    mapping: dict[int, str] = {}
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        try:
+            i = int(r.get("i"))
+        except (TypeError, ValueError):
+            continue
+        c = (r.get("c") or "").strip()
+        if c not in valid:
+            c = "Other"
+        mapping[i] = c
+    return mapping
+
+
+def classify_sessions(
+    sessions: list[dict[str, Any]],
+    claude_bin: str | None,
+    chunk_size: int = 60,
+    max_workers: int = 4,
+) -> list[str]:
+    """Classify each session's first prompt via parallel Haiku calls.
+
+    Returns a list aligned with ``sessions`` mapping each to a category from
+    ``_CLASSIFICATION_CATEGORIES`` (or ``"(unclassified)"`` if Haiku failed).
+    """
+    out: list[str] = ["(unclassified)"] * len(sessions)
+    if not claude_bin or not sessions:
+        return out
+
+    indexed: list[tuple[int, str]] = [
+        (i, s.get("prompt") or "") for i, s in enumerate(sessions) if (s.get("prompt") or "").strip()
+    ]
+    if not indexed:
+        return out
+
+    chunks = [indexed[i : i + chunk_size] for i in range(0, len(indexed), chunk_size)]
+    print(
+        f"  Running {len(chunks)} parallel `claude -p` calls "
+        f"over {len(indexed)} session first-prompts…",
+        file=sys.stderr,
+    )
+
+    with cf.ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as ex:
+        futures = [ex.submit(_classify_chunk, c, claude_bin) for c in chunks]
+        for fut in cf.as_completed(futures):
+            for i, cat in fut.result().items():
+                if 0 <= i < len(out):
+                    out[i] = cat
+    return out
+
+
 def merge_themes(themes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Canonicalize and merge per-chunk themes into a single ranked list."""
     bucket: dict[str, dict[str, Any]] = {}
@@ -605,6 +1113,9 @@ def render_html(
     wordcloud: list[dict[str, Any]] | None,
     langs: dict[str, Any],
     total_tool_calls: int,
+    events: list[list[int]],
+    sessions: list[dict[str, Any]],
+    dims: dict[str, list[str]],
     generated_at: str,
 ) -> str:
     """Render ``HTML_TEMPLATE`` with the prepared payloads.
@@ -622,6 +1133,9 @@ def render_html(
         research_json=json.dumps(research, default=str),
         wordcloud_json=json.dumps(wordcloud) if wordcloud else "null",
         langs_json=json.dumps(langs, default=str),
+        events_json=json.dumps(events, default=str, separators=(",", ":")),
+        sessions_json=json.dumps(sessions, default=str, separators=(",", ":")),
+        dims_json=json.dumps(dims, default=str, separators=(",", ":")),
         total_tool_calls=total_tool_calls,
         websearch_count=research["websearchTotal"],
         generated_at=generated_at,
@@ -683,16 +1197,24 @@ def main(argv: list[str] | None = None) -> int:
     else:
         transcript_count = 0
     print(f"Walking {transcript_count} transcripts…", file=sys.stderr)
-    mcp_block, research, queries, langs, total_tool_calls = walk_transcripts(
-        claude_dir, mcp_filter
-    )
+    walked = walk_with_events(claude_dir, mcp_filter)
+    mcp_block = walked["mcp_block"]
+    research = walked["research"]
+    queries = walked["queries"]
+    langs = walked["langs"]
+    total_tool_calls = walked["total_tool_calls"]
+    events = walked["events"]
+    sessions_rows = walked["sessions"]
+    dims = walked["dims"]
     mcp_label = mcp_block["name"] if mcp_block else "none"
     print(
         f"  → {total_tool_calls} unique tool calls; "
         f"MCP server: {mcp_label}; "
         f"{research['websearchTotal']} WebSearch queries; "
         f"{langs['totalReads']} reads, {langs['totalWrites']} edits "
-        f"across {len(langs['rows'])} languages.",
+        f"across {len(langs['rows'])} languages; "
+        f"{len(events)} event rows; {len(sessions_rows)} sessions; "
+        f"{len(dims['projects'])} projects, {len(dims['skills'])-1} skills.",
         file=sys.stderr,
     )
 
@@ -722,6 +1244,37 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
 
+    # Optionally classify session first-prompts via Haiku and attach the
+    # classification to the corresponding event rows (the events table uses a
+    # 0-based index into dims.classifications; we wrote 0 as a placeholder).
+    if args.no_ai:
+        print("Skipping session classification (--no-ai).", file=sys.stderr)
+    elif not sessions_rows:
+        pass
+    else:
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            pass  # warning already printed for themes step
+        else:
+            print("Classifying session first-prompts via Haiku…", file=sys.stderr)
+            cats = classify_sessions(sessions_rows, claude_bin)
+            cls_idx_map: dict[str, int] = {
+                name: i for i, name in enumerate(dims["classifications"])
+            }
+
+            def intern_cls(name: str) -> int:
+                if name in cls_idx_map:
+                    return cls_idx_map[name]
+                cls_idx_map[name] = len(dims["classifications"])
+                dims["classifications"].append(name)
+                return cls_idx_map[name]
+
+            for i, cat in enumerate(cats):
+                sessions_rows[i]["cls"] = intern_cls(cat)
+            counts: Counter = Counter(cats)
+            top = ", ".join(f"{k}={v}" for k, v in counts.most_common(5))
+            print(f"  → classified {len(sessions_rows)} sessions ({top}).", file=sys.stderr)
+
     html = render_html(
         title=args.title,
         stats=stats,
@@ -730,6 +1283,9 @@ def main(argv: list[str] | None = None) -> int:
         wordcloud=wordcloud,
         langs=langs,
         total_tool_calls=total_tool_calls,
+        events=events,
+        sessions=sessions_rows,
+        dims=dims,
         generated_at=datetime.now().isoformat(timespec="seconds"),
     )
 
@@ -935,6 +1491,108 @@ HTML_TEMPLATE = r"""<!doctype html>
       max-width: 1280px; margin: 24px auto 60px; padding: 0 36px;
       color: var(--text-3); font-size: 12px; line-height: 1.6;
     }
+
+    /* ==== Filter bar ==== */
+    .filterbar {
+      position: sticky; top: 0; z-index: 50;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 36px;
+      display: flex; flex-wrap: wrap; align-items: center;
+      gap: 10px;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+    }
+    .filterbar .fb-label {
+      font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--text-3); font-weight: 600; margin-right: 4px;
+    }
+    .filterbar select, .filterbar input[type="date"] {
+      font: inherit; font-size: 12.5px;
+      padding: 5px 9px; border-radius: 6px;
+      background: var(--card); color: var(--text);
+      border: 1px solid var(--border); cursor: pointer;
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+    .filterbar select:focus, .filterbar input[type="date"]:focus {
+      outline: none; border-color: var(--coral);
+    }
+    .filter-group {
+      position: relative;
+      display: inline-flex; align-items: center; gap: 4px;
+    }
+    .fb-btn {
+      font: inherit; font-size: 12.5px;
+      padding: 5px 11px; border-radius: 6px;
+      background: var(--card); color: var(--text);
+      border: 1px solid var(--border); cursor: pointer;
+      display: inline-flex; align-items: center; gap: 6px;
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+    .fb-btn:hover { border-color: var(--coral); }
+    .fb-btn .count {
+      display: inline-block; min-width: 18px; padding: 0 5px;
+      background: var(--coral); color: #FFF; border-radius: 999px;
+      font-size: 11px; font-weight: 600; text-align: center;
+      line-height: 16px; height: 16px;
+    }
+    .fb-btn .count.zero { background: var(--border); color: var(--text-2); }
+    .fb-btn .chev { color: var(--text-3); font-size: 10px; }
+    .fb-popover {
+      position: absolute; top: calc(100% + 4px); left: 0;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px;
+      min-width: 220px; max-height: 320px; overflow-y: auto;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+      display: none; z-index: 60;
+    }
+    .fb-popover.open { display: block; }
+    .fb-popover label {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 6px; font-size: 12.5px; color: var(--text);
+      cursor: pointer; border-radius: 4px;
+    }
+    .fb-popover label:hover { background: var(--bg); }
+    .fb-popover input[type="checkbox"] { margin: 0; cursor: pointer; }
+    .fb-popover .fb-search {
+      width: 100%; padding: 6px 8px; margin-bottom: 6px;
+      border: 1px solid var(--border); border-radius: 5px;
+      font: inherit; font-size: 12.5px; font-family: 'Inter', system-ui, sans-serif;
+    }
+    .fb-popover .fb-actions {
+      display: flex; gap: 6px; padding: 6px 4px 2px;
+      border-top: 1px solid var(--border); margin-top: 6px;
+    }
+    .fb-popover .fb-actions button {
+      flex: 1; padding: 4px 8px; font-size: 11.5px;
+      background: transparent; border: 1px solid var(--border);
+      border-radius: 4px; cursor: pointer; color: var(--text-2);
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+    .fb-popover .fb-actions button:hover { color: var(--text); border-color: var(--coral); }
+    .fb-reset {
+      margin-left: auto;
+      font: inherit; font-size: 12px;
+      padding: 5px 11px; border-radius: 6px;
+      background: transparent; color: var(--coral-2);
+      border: 1px solid transparent; cursor: pointer;
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+    .fb-reset:hover { background: var(--card); border-color: var(--border); }
+    .filter-warn {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: rgba(204,120,92,0.10); color: var(--coral-2);
+      font-weight: 500; letter-spacing: 0.02em;
+      margin-left: 6px;
+    }
+    .filter-warn.hidden { display: none; }
+    @media print {
+      .filterbar { display: none !important; }
+    }
+    @media (max-width: 760px) {
+      .filterbar { padding: 8px 14px; gap: 6px; }
+      .fb-popover { left: auto; right: 0; }
+    }
   </style>
 </head>
 <body>
@@ -961,12 +1619,53 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<div class="filterbar" id="filterbar">
+  <span class="fb-label">From</span>
+  <input type="date" id="fbDateMin" />
+  <span class="fb-label">to</span>
+  <input type="date" id="fbDateMax" />
+
+  <div class="filter-group" data-dim="models">
+    <button class="fb-btn" data-popover="popModels">
+      Model <span class="count zero" id="cntModels">0</span> <span class="chev">▾</span>
+    </button>
+    <div class="fb-popover" id="popModels"></div>
+  </div>
+  <div class="filter-group" data-dim="projects">
+    <button class="fb-btn" data-popover="popProjects">
+      Project <span class="count zero" id="cntProjects">0</span> <span class="chev">▾</span>
+    </button>
+    <div class="fb-popover" id="popProjects"></div>
+  </div>
+  <div class="filter-group" data-dim="servers">
+    <button class="fb-btn" data-popover="popServers">
+      MCP <span class="count zero" id="cntServers">0</span> <span class="chev">▾</span>
+    </button>
+    <div class="fb-popover" id="popServers"></div>
+  </div>
+  <div class="filter-group" data-dim="skills">
+    <button class="fb-btn" data-popover="popSkills">
+      Skill <span class="count zero" id="cntSkills">0</span> <span class="chev">▾</span>
+    </button>
+    <div class="fb-popover" id="popSkills"></div>
+  </div>
+  <div class="filter-group" data-dim="classes">
+    <button class="fb-btn" data-popover="popClasses">
+      Topic <span class="count zero" id="cntClasses">0</span> <span class="chev">▾</span>
+    </button>
+    <div class="fb-popover" id="popClasses"></div>
+  </div>
+
+  <button class="fb-reset" id="fbReset" type="button" title="Clear all filters">Reset</button>
+</div>
+
 <section class="hero">
   <div class="eyebrow">Local data · stats-cache.json</div>
   <h1>Your token <em>universe</em>, visualized.</h1>
   <p>A dashboard drawn entirely from <span class="source-pill">~/.claude/stats-cache.json</span> and your local
     transcripts. Token totals include input, output, cache reads and cache writes — the full picture, not just
-    the input+output figure shown in <span class="source-pill">/usage</span>.</p>
+    the input+output figure shown in <span class="source-pill">/usage</span>.
+    <span class="filter-warn hidden" id="filterWarn">Filtered view</span></p>
 </section>
 
 <main class="container">
@@ -1244,6 +1943,9 @@ const RESEARCH = {{ research_json|safe }};
 const WORDCLOUD = {{ wordcloud_json|safe }};
 const LANGS = {{ langs_json|safe }};
 const TOTAL_TOOL_CALLS = {{ total_tool_calls }};
+const EVENTS = {{ events_json|safe }};
+const SESSIONS = {{ sessions_json|safe }};
+const DIMS = {{ dims_json|safe }};
 
 // ============== HELPERS ==============
 const fmt = n => new Intl.NumberFormat('en-US').format(Math.round(n));
@@ -1253,6 +1955,7 @@ const compact = n => {
   if (n >= 1e3) return (n/1e3).toFixed(1)+'k';
   return String(n);
 };
+
 const MODEL_COLOR = {
   'claude-opus-4-7':            getComputedStyle(document.documentElement).getPropertyValue('--opus-7').trim(),
   'claude-opus-4-6':            getComputedStyle(document.documentElement).getPropertyValue('--opus-6').trim(),
@@ -1261,7 +1964,7 @@ const MODEL_COLOR = {
   'claude-sonnet-4-6':          getComputedStyle(document.documentElement).getPropertyValue('--sonnet-6').trim(),
   'claude-sonnet-4-5-20250929': getComputedStyle(document.documentElement).getPropertyValue('--sonnet-5').trim(),
 };
-const MODEL_SHORT = {
+const MODEL_SHORT_JS = {
   'claude-opus-4-7':            'Opus 4.7',
   'claude-opus-4-6':            'Opus 4.6',
   'claude-opus-4-5-20251101':   'Opus 4.5',
@@ -1269,18 +1972,16 @@ const MODEL_SHORT = {
   'claude-sonnet-4-6':          'Sonnet 4.6',
   'claude-sonnet-4-5-20250929': 'Sonnet 4.5',
 };
+const SHORT_TO_RAW = Object.fromEntries(
+  Object.entries(MODEL_SHORT_JS).map(([raw, short]) => [short, raw])
+);
 const colorOf = m => MODEL_COLOR[m] || '#888';
-const shortOf = m => MODEL_SHORT[m] || m;
+const shortOf = m => MODEL_SHORT_JS[m] || m;
 
+// ============== Chart.js defaults ==============
 Chart.defaults.font.family = "'Inter', ui-sans-serif, system-ui, sans-serif";
 Chart.defaults.color = '#5B5A56';
 Chart.defaults.borderColor = '#EDE9DC';
-// Disable bar/line/donut animations globally. Animations look fine on
-// screen but Chrome's print/PDF capture frequently fires mid-animation,
-// freezing bars partway from 0 to their final value — which is what made
-// every chart look "shrunk" in the html2pdf output and showed up again
-// in headless --print-to-pdf. Static charts are also cheaper to draw and
-// avoid a layout-shift flicker as data loads.
 Chart.defaults.animation = false;
 Chart.defaults.animations = {};
 Chart.defaults.transitions = { active: { animation: { duration: 0 } } };
@@ -1294,63 +1995,191 @@ Chart.defaults.plugins.tooltip.padding = 10;
 Chart.defaults.plugins.tooltip.cornerRadius = 6;
 Chart.defaults.plugins.tooltip.boxPadding = 4;
 
-// ============== KPIs ==============
-function totalGrandTokens() {
-  let t = 0;
-  for (const m of Object.values(DATA.modelUsage)) {
-    t += m.inputTokens + m.outputTokens + m.cacheReadInputTokens + m.cacheCreationInputTokens;
+// ============== Filter state ==============
+const TOTAL_DATES = DIMS.dates.length;
+const state = {
+  dateMin: 0,
+  dateMax: Math.max(0, TOTAL_DATES - 1),
+  models: new Set(),
+  projects: new Set(),
+  servers: new Set(),
+  skills: new Set(),
+  classes: new Set(),
+};
+const sessCls = SESSIONS.map(s => s.cls);  // session_index -> classification_id
+
+function filtersActive() {
+  return state.dateMin !== 0
+      || state.dateMax !== Math.max(0, TOTAL_DATES - 1)
+      || state.models.size > 0
+      || state.projects.size > 0
+      || state.servers.size > 0
+      || state.skills.size > 0
+      || state.classes.size > 0;
+}
+
+function eventMatches(ev) {
+  // ev = [d, p, m, s, t, skill, lr, le, sess, kind]
+  if (ev[0] < state.dateMin || ev[0] > state.dateMax) return false;
+  if (state.models.size   && !state.models.has(ev[2]))   return false;
+  if (state.projects.size && !state.projects.has(ev[1])) return false;
+  if (state.servers.size  && !state.servers.has(ev[3]))  return false;
+  if (state.skills.size   && !state.skills.has(ev[5]))   return false;
+  if (state.classes.size) {
+    const cls = sessCls[ev[8]];
+    if (cls === undefined || !state.classes.has(cls)) return false;
   }
-  return t;
-}
-function totalIOOnly() {
-  let t = 0;
-  for (const m of Object.values(DATA.modelUsage)) t += m.inputTokens + m.outputTokens;
-  return t;
-}
-const firstDate = (DATA.firstSessionDate || '').slice(0,10);
-const lastDate  = DATA.lastComputedDate || firstDate;
-const totalCalendarDays = firstDate && lastDate
-  ? Math.round((new Date(lastDate) - new Date(firstDate)) / 86400000) + 1
-  : 0;
-const activeDays = (DATA.dailyActivity || []).filter(d => d.messageCount > 0).length;
-
-document.getElementById('windowLabel').textContent = firstDate
-  ? `${firstDate}  →  ${lastDate}`
-  : 'Window: —';
-document.getElementById('kpiTokens').innerHTML = `${compact(totalGrandTokens())}<small>${fmt(totalGrandTokens())} total</small>`;
-document.getElementById('kpiTokensDelta').textContent = `${compact(totalIOOnly())} input+output`;
-document.getElementById('kpiSessions').textContent = fmt(DATA.totalSessions);
-if (DATA.longestSession && DATA.longestSession.duration) {
-  document.getElementById('kpiSessionsDelta').textContent =
-    `longest: ${(DATA.longestSession.duration/3600000).toFixed(1)} h on ${(DATA.longestSession.timestamp||'').slice(0,10)}`;
-}
-document.getElementById('kpiMessages').textContent = fmt(DATA.totalMessages);
-if (DATA.totalSessions > 0) {
-  document.getElementById('kpiMessagesDelta').textContent =
-    `${(DATA.totalMessages / DATA.totalSessions).toFixed(0)} per session avg`;
-}
-document.getElementById('kpiDays').innerHTML = `${activeDays}<small>of ${totalCalendarDays} days</small>`;
-if (totalCalendarDays > 0) {
-  document.getElementById('kpiDaysDelta').textContent =
-    `${(activeDays/totalCalendarDays*100).toFixed(0)}% of calendar days`;
+  return true;
 }
 
-// ============== Daily chart (stacked bar by model) ==============
-(function() {
-  const dates = DATA.dailyModelTokens.map(d => d.date);
+function sessionMatches(s) {
+  // s = {id, proj, start, prompt, cls}
+  // Date check: session is "in range" if its start date index is in range.
+  if (s.start) {
+    const di = DATES_INDEX.get(s.start);
+    if (di !== undefined && (di < state.dateMin || di > state.dateMax)) return false;
+  }
+  if (state.projects.size && !state.projects.has(s.proj)) return false;
+  if (state.classes.size  && !state.classes.has(s.cls))   return false;
+  return true;
+}
+const DATES_INDEX = new Map(DIMS.dates.map((d, i) => [d, i]));
+
+// ============== Date string helpers ==============
+function currentDateRange() {
+  const min = DIMS.dates[state.dateMin] || '';
+  const max = DIMS.dates[state.dateMax] || '';
+  return { min, max };
+}
+
+// ============== Chart registry ==============
+const charts = {};
+
+function destroyChart(id) {
+  if (charts[id]) {
+    try { charts[id].destroy(); } catch (_) {}
+    delete charts[id];
+  }
+}
+
+// ============== KPI rendering ==============
+function renderTopKPIs() {
+  const { min: dMin, max: dMax } = currentDateRange();
+  document.getElementById('windowLabel').textContent = dMin
+    ? `${dMin}  →  ${dMax}` : 'Window: —';
+
+  // dailyModelTokens clipped to date range (always input+output only).
+  const wantedShort = state.models.size
+    ? new Set([...state.models].map(i => DIMS.models[i]))
+    : null;
+
+  let tokensIO = 0;
+  let dailyClipped = [];
+  for (const d of (DATA.dailyModelTokens || [])) {
+    if (d.date < dMin || d.date > dMax) continue;
+    let kept = {};
+    let dayTotal = 0;
+    for (const [m, v] of Object.entries(d.tokensByModel || {})) {
+      if (wantedShort && !wantedShort.has(shortOf(m))) continue;
+      kept[m] = v;
+      dayTotal += v;
+    }
+    if (Object.keys(kept).length) {
+      dailyClipped.push({ date: d.date, tokensByModel: kept });
+      tokensIO += dayTotal;
+    }
+  }
+
+  let tokensTotalDisplay, tokensSubtitle;
+  if (filtersActive()) {
+    tokensTotalDisplay = tokensIO;
+    tokensSubtitle = `${compact(tokensIO)} input+output`;
+  } else {
+    // Original behavior: show grand total including cache.
+    let grand = 0, io = 0;
+    for (const m of Object.values(DATA.modelUsage || {})) {
+      grand += (m.inputTokens||0) + (m.outputTokens||0)
+             + (m.cacheReadInputTokens||0) + (m.cacheCreationInputTokens||0);
+      io    += (m.inputTokens||0) + (m.outputTokens||0);
+    }
+    tokensTotalDisplay = grand;
+    tokensSubtitle = `${compact(io)} input+output`;
+  }
+  document.getElementById('kpiTokens').innerHTML =
+    `${compact(tokensTotalDisplay)}<small>${fmt(tokensTotalDisplay)} total</small>`;
+  document.getElementById('kpiTokensDelta').textContent = tokensSubtitle;
+
+  // Sessions / Messages / Active days — filterable derived from SESSIONS + filteredEvents.
+  let filteredSessions = SESSIONS.filter(sessionMatches);
+  if (filtersActive()) {
+    document.getElementById('kpiSessions').textContent = fmt(filteredSessions.length);
+    document.getElementById('kpiSessionsDelta').textContent = `Sessions in this filtered view`;
+  } else {
+    document.getElementById('kpiSessions').textContent = fmt(DATA.totalSessions);
+    if (DATA.longestSession && DATA.longestSession.duration) {
+      document.getElementById('kpiSessionsDelta').textContent =
+        `longest: ${(DATA.longestSession.duration/3600000).toFixed(1)} h on ${(DATA.longestSession.timestamp||'').slice(0,10)}`;
+    } else {
+      document.getElementById('kpiSessionsDelta').textContent = '';
+    }
+  }
+
+  if (filtersActive()) {
+    // Use filtered-event count as "Messages" proxy.
+    const fEvCount = window._filteredEvents ? window._filteredEvents.length : 0;
+    document.getElementById('kpiMessages').textContent = fmt(fEvCount);
+    document.getElementById('kpiMessagesDelta').textContent = `tool calls in filtered view`;
+  } else {
+    document.getElementById('kpiMessages').textContent = fmt(DATA.totalMessages);
+    if (DATA.totalSessions > 0) {
+      document.getElementById('kpiMessagesDelta').textContent =
+        `${(DATA.totalMessages / DATA.totalSessions).toFixed(0)} per session avg`;
+    }
+  }
+
+  if (filtersActive()) {
+    // Active days = unique dates in filtered events.
+    const fEv = window._filteredEvents || [];
+    const dayIdSet = new Set();
+    for (const ev of fEv) dayIdSet.add(ev[0]);
+    const calRange = state.dateMax - state.dateMin + 1;
+    document.getElementById('kpiDays').innerHTML =
+      `${dayIdSet.size}<small>of ${calRange} days</small>`;
+    document.getElementById('kpiDaysDelta').textContent =
+      calRange > 0 ? `${(dayIdSet.size/calRange*100).toFixed(0)}% of selected window` : '';
+  } else {
+    const firstDate = (DATA.firstSessionDate || '').slice(0,10);
+    const lastDate  = DATA.lastComputedDate || firstDate;
+    const totalCalendarDays = firstDate && lastDate
+      ? Math.round((new Date(lastDate) - new Date(firstDate)) / 86400000) + 1
+      : 0;
+    const activeDays = (DATA.dailyActivity || []).filter(d => d.messageCount > 0).length;
+    document.getElementById('kpiDays').innerHTML = `${activeDays}<small>of ${totalCalendarDays} days</small>`;
+    document.getElementById('kpiDaysDelta').textContent =
+      totalCalendarDays > 0 ? `${(activeDays/totalCalendarDays*100).toFixed(0)}% of calendar days` : '';
+  }
+
+  // Cache results for downstream chart renders.
+  return { dailyClipped, dMin, dMax, wantedShort };
+}
+
+// ============== Daily chart ==============
+function renderDailyChart(dailyClipped) {
+  destroyChart('daily');
+  const dates = dailyClipped.map(d => d.date);
   const modelsInUse = new Set();
-  DATA.dailyModelTokens.forEach(d => Object.keys(d.tokensByModel).forEach(m => modelsInUse.add(m)));
+  dailyClipped.forEach(d => Object.keys(d.tokensByModel).forEach(m => modelsInUse.add(m)));
   const orderedKnown = ['claude-opus-4-7','claude-opus-4-6','claude-opus-4-5-20251101',
                         'claude-haiku-4-5-20251001','claude-sonnet-4-6','claude-sonnet-4-5-20250929'];
   const orderedModels = orderedKnown.filter(m => modelsInUse.has(m))
     .concat([...modelsInUse].filter(m => !orderedKnown.includes(m)));
   const datasets = orderedModels.map(model => ({
     label: shortOf(model),
-    data: DATA.dailyModelTokens.map(d => d.tokensByModel[model] || 0),
+    data: dailyClipped.map(d => d.tokensByModel[model] || 0),
     backgroundColor: colorOf(model),
     borderWidth: 0, borderRadius: 2, stack: 's',
   }));
-  new Chart(document.getElementById('dailyChart'), {
+  charts.daily = new Chart(document.getElementById('dailyChart'), {
     type: 'bar',
     data: { labels: dates, datasets },
     options: {
@@ -1366,15 +2195,32 @@ if (totalCalendarDays > 0) {
       },
     },
   });
-})();
+}
 
-// ============== Donut ==============
-(function() {
-  const entries = Object.entries(DATA.modelUsage)
-    .map(([m, v]) => [m, v.inputTokens + v.outputTokens + v.cacheReadInputTokens + v.cacheCreationInputTokens])
+// ============== Donut & Per-model class breakdown ==============
+function computeModelUsageFiltered(dailyClipped, wantedShort) {
+  // When unfiltered, return DATA.modelUsage as-is (preserves cache totals).
+  if (!filtersActive()) return DATA.modelUsage;
+  // When filtered, recompute model totals from clipped daily I+O only.
+  const out = {};
+  for (const d of dailyClipped) {
+    for (const [m, v] of Object.entries(d.tokensByModel)) {
+      if (!out[m]) out[m] = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+      // We don't have an input/output split per-day; treat as combined.
+      out[m].outputTokens += v;  // pile onto output for the donut/class chart proportionality
+    }
+  }
+  return out;
+}
+
+function renderDonut(usage) {
+  destroyChart('donut');
+  const entries = Object.entries(usage)
+    .map(([m, v]) => [m, (v.inputTokens||0)+(v.outputTokens||0)+(v.cacheReadInputTokens||0)+(v.cacheCreationInputTokens||0)])
+    .filter(([,v]) => v > 0)
     .sort((a,b) => b[1] - a[1]);
   const total = entries.reduce((s, [,v]) => s + v, 0);
-  new Chart(document.getElementById('donutChart'), {
+  charts.donut = new Chart(document.getElementById('donutChart'), {
     type: 'doughnut',
     data: {
       labels: entries.map(([m]) => shortOf(m)),
@@ -1388,26 +2234,27 @@ if (totalCalendarDays > 0) {
       responsive: true, maintainAspectRatio: false, cutout: '62%',
       plugins: {
         legend: { position: 'right' },
-        tooltip: { callbacks: { label: ctx => `${ctx.label}: ${compact(ctx.raw)} (${(ctx.raw/total*100).toFixed(1)}%)` } },
+        tooltip: { callbacks: { label: ctx => `${ctx.label}: ${compact(ctx.raw)} (${total ? (ctx.raw/total*100).toFixed(1) : 0}%)` } },
       },
     },
   });
-})();
+}
 
-// ============== Per-model class breakdown ==============
-(function() {
-  const models = Object.entries(DATA.modelUsage)
+function renderClassChart(usage) {
+  destroyChart('classChart');
+  const models = Object.entries(usage)
+    .filter(([,v]) => (v.inputTokens||0)+(v.outputTokens||0)+(v.cacheReadInputTokens||0)+(v.cacheCreationInputTokens||0) > 0)
     .sort((a,b) => (b[1].inputTokens+b[1].outputTokens+b[1].cacheReadInputTokens+b[1].cacheCreationInputTokens)
                  - (a[1].inputTokens+a[1].outputTokens+a[1].cacheReadInputTokens+a[1].cacheCreationInputTokens));
   const labels = models.map(([m]) => shortOf(m));
   const palette = { input: '#1F1E1D', output: '#CC785C', cacheRead: '#D4A27F', cacheCreate: '#7A4F37' };
   const datasets = [
-    { label: 'Input',        data: models.map(([,v]) => v.inputTokens),               backgroundColor: palette.input,       stack: 's', borderRadius: 2 },
-    { label: 'Output',       data: models.map(([,v]) => v.outputTokens),              backgroundColor: palette.output,      stack: 's', borderRadius: 2 },
-    { label: 'Cache read',   data: models.map(([,v]) => v.cacheReadInputTokens),      backgroundColor: palette.cacheRead,   stack: 's', borderRadius: 2 },
-    { label: 'Cache create', data: models.map(([,v]) => v.cacheCreationInputTokens),  backgroundColor: palette.cacheCreate, stack: 's', borderRadius: 2 },
+    { label: 'Input',        data: models.map(([,v]) => v.inputTokens||0),               backgroundColor: palette.input,       stack: 's', borderRadius: 2 },
+    { label: 'Output',       data: models.map(([,v]) => v.outputTokens||0),              backgroundColor: palette.output,      stack: 's', borderRadius: 2 },
+    { label: 'Cache read',   data: models.map(([,v]) => v.cacheReadInputTokens||0),      backgroundColor: palette.cacheRead,   stack: 's', borderRadius: 2 },
+    { label: 'Cache create', data: models.map(([,v]) => v.cacheCreationInputTokens||0),  backgroundColor: palette.cacheCreate, stack: 's', borderRadius: 2 },
   ];
-  new Chart(document.getElementById('classChart'), {
+  charts.classChart = new Chart(document.getElementById('classChart'), {
     type: 'bar',
     data: { labels, datasets },
     options: {
@@ -1423,24 +2270,34 @@ if (totalCalendarDays > 0) {
       },
     },
   });
-})();
+}
 
-// ============== Monthly ==============
-(function() {
-  const months = Object.keys(DATA.monthlyIO).sort();
+// ============== Monthly chart ==============
+function renderMonthly(dailyClipped) {
+  destroyChart('monthly');
+  // Re-roll monthly from dailyClipped so date filters apply.
+  const byMonth = {};
+  for (const d of dailyClipped) {
+    const month = d.date.slice(0,7);
+    if (!byMonth[month]) byMonth[month] = {};
+    for (const [m, v] of Object.entries(d.tokensByModel)) {
+      byMonth[month][m] = (byMonth[month][m] || 0) + v;
+    }
+  }
+  const months = Object.keys(byMonth).sort();
   const modelsInUse = new Set();
-  for (const m of months) Object.keys(DATA.monthlyIO[m]).forEach(k => modelsInUse.add(k));
+  for (const m of months) Object.keys(byMonth[m]).forEach(k => modelsInUse.add(k));
   const orderedKnown = ['claude-opus-4-7','claude-opus-4-6','claude-opus-4-5-20251101',
                         'claude-haiku-4-5-20251001','claude-sonnet-4-6','claude-sonnet-4-5-20250929'];
   const orderedModels = orderedKnown.filter(m => modelsInUse.has(m))
     .concat([...modelsInUse].filter(m => !orderedKnown.includes(m)));
   const datasets = orderedModels.map(model => ({
     label: shortOf(model),
-    data: months.map(m => DATA.monthlyIO[m][model] || 0),
+    data: months.map(m => byMonth[m][model] || 0),
     backgroundColor: colorOf(model),
     borderWidth: 0, borderRadius: 4, stack: 's',
   }));
-  new Chart(document.getElementById('monthlyChart'), {
+  charts.monthly = new Chart(document.getElementById('monthlyChart'), {
     type: 'bar',
     data: { labels: months, datasets },
     options: {
@@ -1455,14 +2312,18 @@ if (totalCalendarDays > 0) {
       },
     },
   });
-})();
+}
 
-// ============== Heatmap ==============
-(function() {
-  if (!firstDate) return;
-  const byDate = new Map((DATA.dailyActivity || []).map(d => [d.date, d.sessionCount]));
-  const start = new Date(firstDate);
-  const end   = new Date(lastDate);
+// ============== Heatmap (date filter only) ==============
+function renderHeatmap(dMin, dMax) {
+  const grid = document.getElementById('heatmap');
+  grid.innerHTML = '';
+  if (!dMin) return;
+  const byDate = new Map((DATA.dailyActivity || [])
+    .filter(d => d.date >= dMin && d.date <= dMax)
+    .map(d => [d.date, d.sessionCount]));
+  const start = new Date(dMin);
+  const end   = new Date(dMax);
   const cur = new Date(start); cur.setDate(cur.getDate() - cur.getDay());
   const cells = [];
   while (cur <= end) {
@@ -1470,7 +2331,6 @@ if (totalCalendarDays > 0) {
     cells.push({ date: iso, dow: cur.getDay(), sessions: byDate.get(iso) || 0, before: cur < start });
     cur.setDate(cur.getDate() + 1);
   }
-  const grid = document.getElementById('heatmap');
   const g = document.createElement('div'); g.className = 'heat-grid';
   const counts = [...byDate.values()].filter(v => v > 0).sort((a,b) => a-b);
   const q = p => counts[Math.floor(counts.length * p)] || 1;
@@ -1490,13 +2350,15 @@ if (totalCalendarDays > 0) {
     g.appendChild(cell);
   });
   grid.appendChild(g);
-})();
+}
 
 // ============== Hour-of-day ==============
-(function() {
+function renderHourChart() {
+  destroyChart('hour');
+  // hourCounts has no date attribution in stats-cache; filter only works for the full window.
   const hours = Array.from({length:24}, (_,i) => i);
-  const data = hours.map(h => DATA.hourCounts[h] || DATA.hourCounts[String(h)] || 0);
-  new Chart(document.getElementById('hourChart'), {
+  const data = hours.map(h => (DATA.hourCounts||{})[h] || (DATA.hourCounts||{})[String(h)] || 0);
+  charts.hour = new Chart(document.getElementById('hourChart'), {
     type: 'bar',
     data: {
       labels: hours.map(h => h.toString().padStart(2,'0')+':00'),
@@ -1514,30 +2376,61 @@ if (totalCalendarDays > 0) {
       plugins: { legend: { display: false } },
     },
   });
-})();
+}
 
 // ============== MCP server (single section) ==============
-(function() {
-  if (!DBX) return;
-  const days = Object.keys(DBX.dailyTotal).sort();
-  const peakDay = days.reduce((best, d) => DBX.dailyTotal[d] > DBX.dailyTotal[best] ? d : best, days[0] || '');
-  document.getElementById('dbxTotal').textContent = fmt(DBX.totalCalls);
-  if (TOTAL_TOOL_CALLS > 0) {
-    document.getElementById('dbxTotalDelta').textContent =
-      `${(DBX.totalCalls/TOTAL_TOOL_CALLS*100).toFixed(1)}% of all tool calls in transcripts`;
+function aggregateMCPFromEvents(filteredEvents) {
+  if (!DBX) return null;
+  // Match the primary server selected on Python side.
+  const primaryServerName = DBX.name;
+  const serverIdx = DIMS.servers.indexOf(primaryServerName);
+  if (serverIdx < 0) return null;
+
+  const toolCounts = {};
+  const dailyTotal = {};
+  let totalCalls = 0;
+  for (const ev of filteredEvents) {
+    if (ev[9] !== 1) continue;     // kind != MCP
+    if (ev[3] !== serverIdx) continue;
+    const toolName = DIMS.tools[ev[4]] || '(none)';
+    toolCounts[toolName] = (toolCounts[toolName] || 0) + 1;
+    const date = DIMS.dates[ev[0]];
+    if (date) dailyTotal[date] = (dailyTotal[date] || 0) + 1;
+    totalCalls++;
   }
-  document.getElementById('dbxDistinct').textContent = DBX.distinctTools;
+  return {
+    name: primaryServerName,
+    displayName: DBX.displayName,
+    totalCalls,
+    distinctTools: Object.keys(toolCounts).length,
+    toolCounts,
+    dailyTotal,
+  };
+}
+
+function renderMCP(mcpAgg, filteredTotalCalls) {
+  if (!mcpAgg) return;
+  const days = Object.keys(mcpAgg.dailyTotal).sort();
+  const peakDay = days.reduce((best, d) => mcpAgg.dailyTotal[d] > (mcpAgg.dailyTotal[best]||0) ? d : best, days[0] || '');
+  document.getElementById('dbxTotal').textContent = fmt(mcpAgg.totalCalls);
+  document.getElementById('dbxTotalDelta').textContent = filteredTotalCalls > 0
+    ? `${(mcpAgg.totalCalls/filteredTotalCalls*100).toFixed(1)}% of tool calls in view`
+    : '—';
+  document.getElementById('dbxDistinct').textContent = mcpAgg.distinctTools;
   document.getElementById('dbxDistinctDelta').textContent = `tools exercised on this server`;
   document.getElementById('dbxActiveDays').textContent = days.length;
-  if (days.length) {
-    document.getElementById('dbxActiveDaysDelta').textContent = `${days[0]} → ${days[days.length-1]}`;
-  }
-  if (peakDay) {
-    document.getElementById('dbxPeak').innerHTML = `${fmt(DBX.dailyTotal[peakDay])}<small>calls</small>`;
+  document.getElementById('dbxActiveDaysDelta').textContent = days.length
+    ? `${days[0]} → ${days[days.length-1]}` : '';
+  if (peakDay && mcpAgg.dailyTotal[peakDay]) {
+    document.getElementById('dbxPeak').innerHTML = `${fmt(mcpAgg.dailyTotal[peakDay])}<small>calls</small>`;
     document.getElementById('dbxPeakDelta').textContent = `on ${peakDay}`;
+  } else {
+    document.getElementById('dbxPeak').textContent = '0';
+    document.getElementById('dbxPeakDelta').textContent = '';
   }
 
-  const entries = Object.entries(DBX.toolCounts).sort((a,b) => b[1] - a[1]);
+  destroyChart('dbxTools');
+  const entries = Object.entries(mcpAgg.toolCounts).sort((a,b) => b[1] - a[1]);
   const TOP_N = 12;
   const top = entries.slice(0, TOP_N);
   const restSum = entries.slice(TOP_N).reduce((s,[,n]) => s + n, 0);
@@ -1549,7 +2442,7 @@ if (totalCalendarDays > 0) {
     '#6D4737','#7A5A48','#8A6A55','#9B7B66','#AB8B77',
     '#BB9C88','#C9AC99','#9E8B7C'
   ];
-  new Chart(document.getElementById('dbxToolsChart'), {
+  charts.dbxTools = new Chart(document.getElementById('dbxToolsChart'), {
     type: 'bar',
     data: {
       labels,
@@ -1573,6 +2466,7 @@ if (totalCalendarDays > 0) {
     },
   });
 
+  destroyChart('dbxDaily');
   if (days.length) {
     const minD = new Date(days[0]);
     const maxD = new Date(days[days.length-1]);
@@ -1580,13 +2474,13 @@ if (totalCalendarDays > 0) {
     for (let d = new Date(minD); d <= maxD; d.setDate(d.getDate()+1)) {
       allDays.push(d.toISOString().slice(0,10));
     }
-    const dailyValues = allDays.map(d => DBX.dailyTotal[d] || 0);
-    new Chart(document.getElementById('dbxDailyChart'), {
+    const dailyValues = allDays.map(d => mcpAgg.dailyTotal[d] || 0);
+    charts.dbxDaily = new Chart(document.getElementById('dbxDailyChart'), {
       type: 'bar',
       data: {
         labels: allDays,
         datasets: [{
-          label: `${DBX.displayName} MCP calls`,
+          label: `${mcpAgg.displayName} MCP calls`,
           data: dailyValues,
           backgroundColor: '#CC785C', hoverBackgroundColor: '#A55A40',
           borderWidth: 0, borderRadius: 2,
@@ -1605,29 +2499,49 @@ if (totalCalendarDays > 0) {
       },
     });
   }
-})();
+}
 
 // ============== Web research ==============
-(function() {
-  const total = RESEARCH.webfetchTotal + RESEARCH.websearchTotal + RESEARCH.researchTotal;
-  document.getElementById('resTotal').textContent = fmt(total);
-  if (TOTAL_TOOL_CALLS > 0) {
-    document.getElementById('resTotalDelta').textContent =
-      `~${(total/TOTAL_TOOL_CALLS*100).toFixed(1)}% of all tool calls in transcripts`;
+function aggregateResearchFromEvents(filteredEvents) {
+  let wf = 0, ws = 0, re_ = 0;
+  const wfByDay = {}, wsByDay = {}, reByDay = {};
+  for (const ev of filteredEvents) {
+    const kind = ev[9];
+    if (kind !== 2 && kind !== 3 && kind !== 4) continue;
+    const date = DIMS.dates[ev[0]];
+    if (kind === 2) { wf++; if (date) wfByDay[date] = (wfByDay[date]||0)+1; }
+    else if (kind === 3) { ws++; if (date) wsByDay[date] = (wsByDay[date]||0)+1; }
+    else if (kind === 4) { re_++; if (date) reByDay[date] = (reByDay[date]||0)+1; }
   }
-  document.getElementById('resWF').textContent = fmt(RESEARCH.webfetchTotal);
-  document.getElementById('resWFDelta').textContent = `${RESEARCH.uniqueDomains} unique domains visited`;
-  document.getElementById('resWS').textContent = fmt(RESEARCH.websearchTotal);
-  document.getElementById('resWSDelta').textContent = `${fmt(RESEARCH.uniqueQueries)} distinct queries`;
-  document.getElementById('resRE').textContent = fmt(RESEARCH.researchTotal);
+  return { webfetchTotal: wf, websearchTotal: ws, researchTotal: re_,
+           webfetchByDay: wfByDay, websearchByDay: wsByDay, researchByDay: reByDay };
+}
+
+function renderResearch(agg, filteredTotalCalls) {
+  const total = agg.webfetchTotal + agg.websearchTotal + agg.researchTotal;
+  document.getElementById('resTotal').textContent = fmt(total);
+  document.getElementById('resTotalDelta').textContent = filteredTotalCalls > 0
+    ? `~${(total/filteredTotalCalls*100).toFixed(1)}% of tool calls in view` : '—';
+  document.getElementById('resWF').textContent = fmt(agg.webfetchTotal);
+  document.getElementById('resWFDelta').textContent = filtersActive()
+    ? `(domains list reflects full corpus)`
+    : `${RESEARCH.uniqueDomains} unique domains visited`;
+  document.getElementById('resWS').textContent = fmt(agg.websearchTotal);
+  document.getElementById('resWSDelta').textContent = filtersActive()
+    ? `(query themes reflect full corpus)`
+    : `${fmt(RESEARCH.uniqueQueries)} distinct queries`;
+  document.getElementById('resRE').textContent = fmt(agg.researchTotal);
   document.getElementById('resREDelta').textContent = `Spawned subagent for deep research`;
 
+  // Domain chart is from the pre-aggregated RESEARCH.domainCounts (not filterable
+  // without shipping the URL strings — that would double the HTML size).
+  destroyChart('resDomains');
   const entries = Object.entries(RESEARCH.domainCounts).sort((a,b) => b[1] - a[1]);
   const labels = entries.map(([k]) => k);
   const values = entries.map(([,v]) => v);
   if (labels.length) {
     const palette = ['#CC785C','#BD6F54','#AE664D','#A05E47','#915541','#834D3B','#7A4F37','#6D4737','#604138','#544039','#4A3E37','#5C4838','#7F6650','#8A745E','#9A8770','#AA9A82','#B7AB95','#C3BCA8','#CECCBA','#D8D9CB'];
-    new Chart(document.getElementById('resDomainsChart'), {
+    charts.resDomains = new Chart(document.getElementById('resDomainsChart'), {
       type: 'bar',
       data: {
         labels,
@@ -1652,10 +2566,11 @@ if (totalCalendarDays > 0) {
     });
   }
 
+  destroyChart('resDaily');
   const allDayKeys = new Set([
-    ...Object.keys(RESEARCH.webfetchByDay),
-    ...Object.keys(RESEARCH.websearchByDay),
-    ...Object.keys(RESEARCH.researchByDay),
+    ...Object.keys(agg.webfetchByDay),
+    ...Object.keys(agg.websearchByDay),
+    ...Object.keys(agg.researchByDay),
   ]);
   if (allDayKeys.has('')) allDayKeys.delete('');
   const days = [...allDayKeys].sort();
@@ -1667,11 +2582,11 @@ if (totalCalendarDays > 0) {
       fullDays.push(d.toISOString().slice(0,10));
     }
     const ds = [
-      { label: 'WebFetch',        data: fullDays.map(d => RESEARCH.webfetchByDay[d]  || 0), backgroundColor: '#CC785C', stack:'r', borderWidth:0, borderRadius:2 },
-      { label: 'WebSearch',       data: fullDays.map(d => RESEARCH.websearchByDay[d] || 0), backgroundColor: '#7A4F37', stack:'r', borderWidth:0, borderRadius:2 },
-      { label: 'research-expert', data: fullDays.map(d => RESEARCH.researchByDay[d]  || 0), backgroundColor: '#D4A27F', stack:'r', borderWidth:0, borderRadius:2 },
+      { label: 'WebFetch',        data: fullDays.map(d => agg.webfetchByDay[d]  || 0), backgroundColor: '#CC785C', stack:'r', borderWidth:0, borderRadius:2 },
+      { label: 'WebSearch',       data: fullDays.map(d => agg.websearchByDay[d] || 0), backgroundColor: '#7A4F37', stack:'r', borderWidth:0, borderRadius:2 },
+      { label: 'research-expert', data: fullDays.map(d => agg.researchByDay[d]  || 0), backgroundColor: '#D4A27F', stack:'r', borderWidth:0, borderRadius:2 },
     ];
-    new Chart(document.getElementById('resDailyChart'), {
+    charts.resDaily = new Chart(document.getElementById('resDailyChart'), {
       type: 'bar',
       data: { labels: fullDays, datasets: ds },
       options: {
@@ -1688,10 +2603,10 @@ if (totalCalendarDays > 0) {
       },
     });
   }
-})();
+}
 
-// ============== Word cloud ==============
-(function() {
+// ============== Word cloud (static — run once) ==============
+function renderWordcloud() {
   if (!WORDCLOUD || !window.d3 || !d3.layout || !d3.layout.cloud) return;
   const container = document.getElementById('wordcloud');
   if (!container) return;
@@ -1751,35 +2666,79 @@ if (totalCalendarDays > 0) {
       tbody.appendChild(tr);
     });
   }
-})();
+}
 
 // ============== Programming languages ==============
-(function() {
-  if (!LANGS || !LANGS.rows || !LANGS.rows.length) return;
-  document.getElementById('langReads').textContent       = fmt(LANGS.totalReads);
-  if (LANGS.totalReads + LANGS.totalWrites > 0) {
+function aggregateLangsFromEvents(filteredEvents) {
+  const reads = {}, edits = {};
+  for (const ev of filteredEvents) {
+    const kind = ev[9];
+    if (kind === 5 && ev[6] > 0) {
+      const lang = DIMS.langs[ev[6]];
+      reads[lang] = (reads[lang] || 0) + 1;
+    } else if (kind === 6 && ev[7] > 0) {
+      const lang = DIMS.langs[ev[7]];
+      edits[lang] = (edits[lang] || 0) + 1;
+    }
+  }
+  const all = new Set([...Object.keys(reads), ...Object.keys(edits)]);
+  const rows = [];
+  for (const lang of all) {
+    rows.push({
+      lang, reads: reads[lang]||0, edits: edits[lang]||0,
+      uniqRead: 0, uniqEdit: 0,   // not derivable from row-level events
+    });
+  }
+  rows.sort((a,b) => (b.reads+b.edits) - (a.reads+a.edits));
+  return {
+    totalReads: Object.values(reads).reduce((s,v) => s+v, 0),
+    totalWrites: Object.values(edits).reduce((s,v) => s+v, 0),
+    uniqueRead: 0,   // hidden in filter mode
+    uniqueWrite: 0,
+    rows,
+  };
+}
+
+function renderLangs(agg) {
+  destroyChart('langChart');
+  // For unfiltered view, use the original LANGS payload (so unique-file counts show).
+  const useOriginal = !filtersActive();
+  const view = useOriginal ? LANGS : agg;
+
+  document.getElementById('langReads').textContent       = fmt(view.totalReads);
+  if (view.totalReads + view.totalWrites > 0) {
     document.getElementById('langReadsDelta').textContent  =
-      `${(LANGS.totalReads/(LANGS.totalReads+LANGS.totalWrites)*100).toFixed(0)}% of file activity`;
+      `${(view.totalReads/(view.totalReads+view.totalWrites)*100).toFixed(0)}% of file activity`;
+  } else {
+    document.getElementById('langReadsDelta').textContent = '—';
   }
-  document.getElementById('langEdits').textContent       = fmt(LANGS.totalWrites);
-  if (LANGS.totalReads > 0) {
+  document.getElementById('langEdits').textContent       = fmt(view.totalWrites);
+  if (view.totalReads > 0) {
     document.getElementById('langEditsDelta').textContent  =
-      `${(LANGS.totalWrites/LANGS.totalReads).toFixed(2)}× ratio vs reads`;
+      `${(view.totalWrites/view.totalReads).toFixed(2)}× ratio vs reads`;
+  } else {
+    document.getElementById('langEditsDelta').textContent = '—';
   }
-  document.getElementById('langUniqRead').textContent    = fmt(LANGS.uniqueRead);
-  if (LANGS.uniqueRead > 0) {
-    document.getElementById('langUniqReadDelta').textContent = `${(LANGS.totalReads/LANGS.uniqueRead).toFixed(1)} avg reads per file`;
-  }
-  document.getElementById('langUniqEdit').textContent    = fmt(LANGS.uniqueWrite);
-  if (LANGS.uniqueWrite > 0) {
-    document.getElementById('langUniqEditDelta').textContent = `${(LANGS.totalWrites/LANGS.uniqueWrite).toFixed(1)} avg edits per file`;
+  if (useOriginal) {
+    document.getElementById('langUniqRead').textContent    = fmt(view.uniqueRead);
+    document.getElementById('langUniqReadDelta').textContent = view.uniqueRead > 0
+      ? `${(view.totalReads/view.uniqueRead).toFixed(1)} avg reads per file` : '—';
+    document.getElementById('langUniqEdit').textContent    = fmt(view.uniqueWrite);
+    document.getElementById('langUniqEditDelta').textContent = view.uniqueWrite > 0
+      ? `${(view.totalWrites/view.uniqueWrite).toFixed(1)} avg edits per file` : '—';
+  } else {
+    document.getElementById('langUniqRead').textContent = '—';
+    document.getElementById('langUniqReadDelta').textContent = 'not available in filtered view';
+    document.getElementById('langUniqEdit').textContent = '—';
+    document.getElementById('langUniqEditDelta').textContent = 'not available in filtered view';
   }
 
-  const rows = LANGS.rows
-    .filter(r => r.lang !== 'Other / ?')
+  const rows = (view.rows || [])
+    .filter(r => r.lang !== 'Other / ?' && r.lang !== '(none)')
     .slice(0, 14);
+  if (!rows.length) return;
   const labels = rows.map(r => r.lang);
-  new Chart(document.getElementById('langChart'), {
+  charts.langChart = new Chart(document.getElementById('langChart'), {
     type: 'bar',
     data: {
       labels,
@@ -1798,98 +2757,30 @@ if (totalCalendarDays > 0) {
       },
       plugins: {
         legend: { position: 'bottom' },
-        tooltip: {
-          callbacks: {
-            label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)} calls`,
-            afterBody: items => {
-              const row = rows[items[0].dataIndex];
-              return `Unique files — read: ${fmt(row.uniqRead)} · edit: ${fmt(row.uniqEdit)}`;
-            },
-          },
-        },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)} calls` } },
       },
     },
   });
-})();
+}
 
-// ============== Export to PDF (via browser print) ==============
-// The reference dashboard tried to use html2pdf.js, which captures the page
-// via html2canvas at desktop width and then places it at native pixel size
-// on an A4 page — meaning right-side content gets clipped, KPI cards collapse
-// to single-letter wrapping, and the output is split across ~10 ragged pages.
-// Chrome's native print engine handles all of this correctly via @media print:
-// vector text, real layout reflow, page-break-inside on cards. So the button
-// just triggers window.print() and the @media print rules take care of the
-// rest. One extra dialog click vs a direct download, but the resulting PDF
-// is sharp, paginates cleanly, and works on every browser without a CDN.
-//
-// Chart.js charts need an explicit resize() before the print snapshot is
-// taken, otherwise their canvas bitmap stays at desktop dimensions and the
-// bars end up scaled to a fraction of the new container width. The
-// beforeprint hook redraws each chart at print-target size; afterprint
-// restores screen size when the dialog closes.
-(function() {
-  const allCharts = () => (typeof Chart !== 'undefined' && Chart.instances)
-    ? Object.values(Chart.instances)
-    : [];
-
-  // Chart.js's responsive resize is async (it schedules a redraw via RAF),
-  // but Chrome's print snapshot is taken synchronously right after the
-  // beforeprint handlers return. So a bare resize() leaves the canvas
-  // bitmap stale and the bars come out at the old desktop scale.
-  // We force a synchronous redraw via update('none') — and pass the parent's
-  // *current* CSS box to resize() so Chart.js can't fall back to a cached size.
-  function redrawAll() {
-    for (const c of allCharts()) {
-      try {
-        const parent = c.canvas.parentElement;
-        if (parent && parent.clientWidth > 0 && parent.clientHeight > 0) {
-          c.resize(parent.clientWidth, parent.clientHeight);
-        } else {
-          c.resize();
-        }
-        c.update('none');
-      } catch (_) { /* chart was destroyed; ignore */ }
-    }
-  }
-
-  window.addEventListener('beforeprint', redrawAll);
-  window.addEventListener('afterprint', redrawAll);
-
-  // Belt-and-suspenders: matchMedia fires synchronously when the print media
-  // state flips on, before beforeprint in some browsers (older Safari).
-  const mql = (typeof window.matchMedia === 'function') && window.matchMedia('print');
-  if (mql) {
-    const cb = (e) => { if (e.matches) redrawAll(); };
-    if (typeof mql.addEventListener === 'function') mql.addEventListener('change', cb);
-    else if (typeof mql.addListener === 'function') mql.addListener(cb);
-  }
-
-  const btn = document.getElementById('exportPdfBtn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    // Trigger a redraw before opening the dialog so charts are already at
-    // print dimensions by the time the user clicks "Save as PDF".
-    redrawAll();
-    requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
-  });
-})();
-
-// ============== Model table ==============
-(function() {
+// ============== Model breakdown table ==============
+function renderModelTable(usage) {
   const tbody = document.getElementById('modelTable');
   const tfoot = document.getElementById('modelTableFoot');
-  const grand = totalGrandTokens();
-  const rows = Object.entries(DATA.modelUsage)
+  tbody.innerHTML = '';
+  tfoot.innerHTML = '';
+  const rows = Object.entries(usage)
     .map(([m, v]) => ({
       model: m,
-      input: v.inputTokens,
-      output: v.outputTokens,
-      cacheRead: v.cacheReadInputTokens,
-      cacheCreate: v.cacheCreationInputTokens,
-      total: v.inputTokens + v.outputTokens + v.cacheReadInputTokens + v.cacheCreationInputTokens,
+      input: v.inputTokens||0,
+      output: v.outputTokens||0,
+      cacheRead: v.cacheReadInputTokens||0,
+      cacheCreate: v.cacheCreationInputTokens||0,
+      total: (v.inputTokens||0)+(v.outputTokens||0)+(v.cacheReadInputTokens||0)+(v.cacheCreationInputTokens||0),
     }))
+    .filter(r => r.total > 0)
     .sort((a,b) => b.total - a.total);
+  const grand = rows.reduce((s, r) => s + r.total, 0);
   for (const r of rows) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -1913,7 +2804,242 @@ if (totalCalendarDays > 0) {
     <td>${fmt(sum('total'))}</td>
     <td>100%</td>
   </tr>`;
+}
+
+// ============== Apply filters orchestrator ==============
+function applyFilters() {
+  // 1) Compute filtered events once and cache for downstream use.
+  window._filteredEvents = EVENTS.filter(eventMatches);
+  const filteredEvents = window._filteredEvents;
+
+  // 2) KPI block also computes the date-clipped DATA view we re-use.
+  const { dailyClipped, dMin, dMax } = renderTopKPIs();
+
+  // 3) Model usage / token charts.
+  const usage = computeModelUsageFiltered(dailyClipped, state.models);
+  renderDailyChart(dailyClipped);
+  renderDonut(usage);
+  renderClassChart(usage);
+  renderMonthly(dailyClipped);
+
+  // 4) Activity charts.
+  renderHeatmap(dMin, dMax);
+  renderHourChart();
+
+  // 5) MCP / Research / Languages from EVENTS.
+  renderMCP(aggregateMCPFromEvents(filteredEvents), filteredEvents.length);
+  renderResearch(aggregateResearchFromEvents(filteredEvents), filteredEvents.length);
+  renderLangs(aggregateLangsFromEvents(filteredEvents));
+
+  // 6) Model breakdown table.
+  renderModelTable(usage);
+
+  // 7) Filter UI count badges + warning banner.
+  updateFilterBadges();
+  const warn = document.getElementById('filterWarn');
+  warn.classList.toggle('hidden', !filtersActive());
+  warn.textContent = state.projects.size > 0
+    ? "Filtered view · token charts ignore project (stats-cache has no per-project attribution)"
+    : "Filtered view";
+}
+
+// ============== Filter UI population ==============
+function buildPopover(popId, options, stateSet, allowSearch) {
+  const pop = document.getElementById(popId);
+  pop.innerHTML = '';
+  if (allowSearch && options.length > 8) {
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'fb-search';
+    inp.placeholder = 'Search…';
+    inp.addEventListener('input', e => {
+      const q = e.target.value.toLowerCase();
+      pop.querySelectorAll('label').forEach(l => {
+        const text = l.dataset.text || '';
+        l.style.display = text.toLowerCase().includes(q) ? 'flex' : 'none';
+      });
+    });
+    pop.appendChild(inp);
+  }
+  for (const opt of options) {
+    const lbl = document.createElement('label');
+    lbl.dataset.text = opt.label;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(opt.value);
+    cb.checked = stateSet.has(opt.value);
+    cb.addEventListener('change', () => {
+      if (cb.checked) stateSet.add(opt.value);
+      else stateSet.delete(opt.value);
+      applyFilters();
+    });
+    lbl.appendChild(cb);
+    const span = document.createElement('span'); span.textContent = opt.label;
+    lbl.appendChild(span);
+    pop.appendChild(lbl);
+  }
+  const actions = document.createElement('div'); actions.className = 'fb-actions';
+  const selAll = document.createElement('button'); selAll.textContent = 'Select all';
+  selAll.addEventListener('click', () => {
+    stateSet.clear();
+    options.forEach(o => stateSet.add(o.value));
+    pop.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = true);
+    applyFilters();
+  });
+  const clr = document.createElement('button'); clr.textContent = 'Clear';
+  clr.addEventListener('click', () => {
+    stateSet.clear();
+    pop.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+    applyFilters();
+  });
+  actions.appendChild(selAll); actions.appendChild(clr);
+  pop.appendChild(actions);
+}
+
+function updateFilterBadges() {
+  const upd = (id, set) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = String(set.size);
+    el.classList.toggle('zero', set.size === 0);
+  };
+  upd('cntModels',   state.models);
+  upd('cntProjects', state.projects);
+  upd('cntServers',  state.servers);
+  upd('cntSkills',   state.skills);
+  upd('cntClasses',  state.classes);
+}
+
+function populateAllPopovers() {
+  // Models: known short names from MODEL_SHORT_JS first, then any extra dims.
+  const modelOpts = DIMS.models.map((label, i) => ({ label, value: i }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  buildPopover('popModels', modelOpts, state.models, false);
+
+  const projectOpts = DIMS.projects.map((label, i) => ({ label, value: i }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  buildPopover('popProjects', projectOpts, state.projects, projectOpts.length > 8);
+
+  // Servers: skip index 0 which is "(none)".
+  const serverOpts = DIMS.servers.slice(1).map((label, i) => ({ label, value: i + 1 }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  buildPopover('popServers', serverOpts, state.servers, false);
+
+  // Skills: skip index 0.
+  const skillOpts = DIMS.skills.slice(1).map((label, i) => ({ label, value: i + 1 }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  buildPopover('popSkills', skillOpts, state.skills, skillOpts.length > 8);
+
+  // Classifications: skip index 0 which is "(unclassified)".
+  const clsOpts = DIMS.classifications.slice(1).map((label, i) => ({ label, value: i + 1 }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  buildPopover('popClasses', clsOpts, state.classes, false);
+}
+
+// ============== Date input wiring ==============
+function setupDateInputs() {
+  const minInput = document.getElementById('fbDateMin');
+  const maxInput = document.getElementById('fbDateMax');
+  const first = DIMS.dates[0] || '';
+  const last  = DIMS.dates[DIMS.dates.length - 1] || '';
+  minInput.value = first; minInput.min = first; minInput.max = last;
+  maxInput.value = last;  maxInput.min = first; maxInput.max = last;
+  minInput.addEventListener('change', e => {
+    const v = e.target.value;
+    // Find closest date index >= v
+    let idx = DIMS.dates.findIndex(d => d >= v);
+    if (idx < 0) idx = 0;
+    state.dateMin = idx;
+    if (state.dateMin > state.dateMax) state.dateMax = state.dateMin;
+    applyFilters();
+  });
+  maxInput.addEventListener('change', e => {
+    const v = e.target.value;
+    // Find closest date index <= v
+    let idx = -1;
+    for (let i = DIMS.dates.length - 1; i >= 0; i--) {
+      if (DIMS.dates[i] <= v) { idx = i; break; }
+    }
+    if (idx < 0) idx = DIMS.dates.length - 1;
+    state.dateMax = idx;
+    if (state.dateMax < state.dateMin) state.dateMin = state.dateMax;
+    applyFilters();
+  });
+}
+
+// ============== Popover open/close ==============
+function setupPopoverToggles() {
+  document.querySelectorAll('.fb-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const targetId = btn.dataset.popover;
+      const target = document.getElementById(targetId);
+      // Close all others.
+      document.querySelectorAll('.fb-popover').forEach(p => {
+        if (p !== target) p.classList.remove('open');
+      });
+      target.classList.toggle('open');
+    });
+  });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('.filter-group')) {
+      document.querySelectorAll('.fb-popover').forEach(p => p.classList.remove('open'));
+    }
+  });
+}
+
+function setupReset() {
+  document.getElementById('fbReset').addEventListener('click', () => {
+    state.dateMin = 0; state.dateMax = Math.max(0, TOTAL_DATES - 1);
+    state.models.clear(); state.projects.clear(); state.servers.clear();
+    state.skills.clear(); state.classes.clear();
+    document.getElementById('fbDateMin').value = DIMS.dates[0] || '';
+    document.getElementById('fbDateMax').value = DIMS.dates[DIMS.dates.length-1] || '';
+    populateAllPopovers();
+    applyFilters();
+  });
+}
+
+// ============== Export to PDF ==============
+(function() {
+  const allCharts = () => (typeof Chart !== 'undefined' && Chart.instances)
+    ? Object.values(Chart.instances) : [];
+  function redrawAll() {
+    for (const c of allCharts()) {
+      try {
+        const parent = c.canvas.parentElement;
+        if (parent && parent.clientWidth > 0 && parent.clientHeight > 0) {
+          c.resize(parent.clientWidth, parent.clientHeight);
+        } else {
+          c.resize();
+        }
+        c.update('none');
+      } catch (_) {}
+    }
+  }
+  window.addEventListener('beforeprint', redrawAll);
+  window.addEventListener('afterprint', redrawAll);
+  const mql = (typeof window.matchMedia === 'function') && window.matchMedia('print');
+  if (mql) {
+    const cb = (e) => { if (e.matches) redrawAll(); };
+    if (typeof mql.addEventListener === 'function') mql.addEventListener('change', cb);
+    else if (typeof mql.addListener === 'function') mql.addListener(cb);
+  }
+  const btn = document.getElementById('exportPdfBtn');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      redrawAll();
+      requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
+    });
+  }
 })();
+
+// ============== Boot ==============
+populateAllPopovers();
+setupDateInputs();
+setupPopoverToggles();
+setupReset();
+renderWordcloud();
+applyFilters();
 </script>
 </body>
 </html>
