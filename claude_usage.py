@@ -447,6 +447,18 @@ def walk_transcripts(
 _COMMAND_TAG_RE = re.compile(r"<command-name>\s*/?([\w\-:]+)\s*</command-name>", re.IGNORECASE)
 _SLASH_CMD_RE = re.compile(r"^/([\w\-:]+)\b")
 
+# Claude Code built-in slash commands. Detected the same way as user-defined
+# skills (via <command-name> tags), but we don't surface them as "skills" in
+# the dashboard. This list is intentionally a superset of the official docs
+# so future-Claude-Code additions stay filtered out by default.
+_SLASH_BUILTINS: frozenset[str] = frozenset({
+    "clear", "compact", "model", "init", "exit", "help", "status", "memory",
+    "resume", "quit", "save", "logout", "mcp", "doctor", "ide", "terminal-setup",
+    "context", "simplify", "cost", "config", "login", "feedback", "bug",
+    "fast", "loop", "remember", "permissions", "agents", "output-style",
+    "continue", "release-notes", "usage", "rewind", "add-dir",
+})
+
 
 def _first_user_text(rec: dict) -> str:
     """Pull the text out of a user record, ignoring tool_result blocks."""
@@ -1142,6 +1154,13 @@ def render_html(
         # or no claude CLI). dims.classifications always starts with the
         # placeholder "(unclassified)"; real categories appear after that.
         has_classifications=len(dims.get("classifications", [])) > 1,
+        # Hide the Skills section unless at least one user-defined skill was
+        # detected. dims.skills[0] is the "(none)" placeholder; some of the
+        # rest are Claude Code built-ins (/clear, /compact, /model, etc.)
+        # which we don't surface as "skills".
+        has_skills=any(
+            sk and sk not in _SLASH_BUILTINS for sk in dims.get("skills", [])
+        ),
         generated_at=generated_at,
     )
 
@@ -1797,6 +1816,37 @@ HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </div>
     <div class="chart-wrap tall" style="height:380px"><canvas id="topicChart"></canvas></div>
+  </div>
+  {% endif %}
+
+  {% if has_skills %}
+  <h2 class="section-title">Skills you used</h2>
+  <div class="grid cols-4" style="margin-bottom:16px">
+    <div class="card"><h3>Skill invocations</h3><p class="sub">Tool calls under an active skill</p>
+      <div class="big" id="skillCalls">—</div>
+      <div class="delta" id="skillCallsDelta">—</div>
+    </div>
+    <div class="card"><h3>Unique skills</h3><p class="sub">Distinct skill names invoked</p>
+      <div class="big" id="skillUnique">—</div>
+      <div class="delta" id="skillUniqueDelta">—</div>
+    </div>
+    <div class="card"><h3>Most used</h3><p class="sub">Skill with the most tool calls</p>
+      <div class="big" id="skillTop" style="font-size:24px;">—</div>
+      <div class="delta" id="skillTopDelta">—</div>
+    </div>
+    <div class="card"><h3>Skill-using sessions</h3><p class="sub">Sessions that invoked any skill</p>
+      <div class="big" id="skillSess">—</div>
+      <div class="delta" id="skillSessDelta">—</div>
+    </div>
+  </div>
+  <div class="card chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">Tool calls and sessions by skill</div>
+        <div class="chart-sub">Custom skills only — Claude Code built-ins (<code>/clear</code>, <code>/compact</code>, <code>/model</code>, etc.) are excluded · chart ignores the skill filter to keep the distribution visible while you slice</div>
+      </div>
+    </div>
+    <div class="chart-wrap tall" style="height:420px"><canvas id="skillChart"></canvas></div>
   </div>
   {% endif %}
 
@@ -2826,6 +2876,141 @@ function renderTopics() {
   });
 }
 
+// ============== Skills (parsed from <command-name>) ==============
+// Like eventMatches but ignores the skills filter so the chart keeps its
+// shape when the user picks specific skills.
+function eventMatchesIgnoreSkill(ev) {
+  if (ev[0] < state.dateMin || ev[0] > state.dateMax) return false;
+  if (state.models.size   && !state.models.has(ev[2]))   return false;
+  if (state.projects.size && !state.projects.has(ev[1])) return false;
+  if (state.servers.size  && !state.servers.has(ev[3]))  return false;
+  if (state.classes.size) {
+    const cls = sessCls[ev[8]];
+    if (cls === undefined || !state.classes.has(cls)) return false;
+  }
+  return true;
+}
+
+// Claude Code's built-in slash commands. Detected exactly the same way as
+// user-defined skills (via the <command-name> tag) so we filter them out at
+// render time. The filter UI keeps them so users can still slice the rest of
+// the dashboard by "what was I doing while clearing context".
+const SLASH_BUILTINS = new Set([
+  'clear', 'compact', 'model', 'init', 'exit', 'help', 'status', 'memory',
+  'resume', 'quit', 'save', 'logout', 'mcp', 'doctor', 'ide', 'terminal-setup',
+  'context', 'simplify', 'cost', 'config', 'login', 'feedback', 'bug',
+  'fast', 'loop', 'remember', 'permissions', 'agents', 'output-style',
+  'continue', 'release-notes', 'usage', 'rewind', 'add-dir',
+]);
+
+function aggregateSkills() {
+  const callsBySkill = {};
+  const sessionsBySkill = {};       // skill -> Set<session_idx>
+  let totalSkillCalls = 0;
+  for (const ev of EVENTS) {
+    if (ev[5] === 0) continue;            // no skill in scope
+    if (!eventMatchesIgnoreSkill(ev)) continue;
+    const sk = DIMS.skills[ev[5]] || '(none)';
+    if (SLASH_BUILTINS.has(sk)) continue;  // hide built-ins from the chart
+    callsBySkill[sk] = (callsBySkill[sk] || 0) + 1;
+    if (!sessionsBySkill[sk]) sessionsBySkill[sk] = new Set();
+    sessionsBySkill[sk].add(ev[8]);
+    totalSkillCalls++;
+  }
+  return { callsBySkill, sessionsBySkill, totalSkillCalls };
+}
+
+function renderSkills() {
+  if (!document.getElementById('skillChart')) return;     // section hidden
+  destroyChart('skillChart');
+  const { callsBySkill, sessionsBySkill, totalSkillCalls } = aggregateSkills();
+  const rows = Object.keys(callsBySkill).map(sk => ({
+    skill: sk,
+    calls: callsBySkill[sk],
+    sessions: sessionsBySkill[sk]?.size || 0,
+  })).sort((a, b) => b.calls - a.calls);
+
+  // KPI cards
+  const unique = rows.length;
+  const allSkillSessions = new Set();
+  for (const s of Object.values(sessionsBySkill)) for (const id of s) allSkillSessions.add(id);
+  const totalEventsInView = (window._filteredEvents || []).length;
+
+  document.getElementById('skillCalls').textContent = fmt(totalSkillCalls);
+  document.getElementById('skillCallsDelta').textContent = totalEventsInView > 0
+    ? `${(totalSkillCalls / totalEventsInView * 100).toFixed(1)}% of tool calls in view`
+    : '—';
+  document.getElementById('skillUnique').textContent = String(unique);
+  const totalUserSkills = DIMS.skills
+    .slice(1)                              // drop the "(none)" placeholder
+    .filter(sk => !SLASH_BUILTINS.has(sk))
+    .length;
+  document.getElementById('skillUniqueDelta').textContent =
+    `of ${totalUserSkills} user-defined skills detected`;
+  if (rows.length) {
+    document.getElementById('skillTop').textContent = rows[0].skill;
+    document.getElementById('skillTopDelta').textContent =
+      `${fmt(rows[0].calls)} calls · ${rows[0].sessions} sessions`;
+  } else {
+    document.getElementById('skillTop').textContent = '—';
+    document.getElementById('skillTopDelta').textContent = '';
+  }
+  document.getElementById('skillSess').textContent = fmt(allSkillSessions.size);
+  document.getElementById('skillSessDelta').textContent = `Sessions invoking at least one skill`;
+
+  if (!rows.length) return;
+  const TOP_N = 15;
+  const top = rows.slice(0, TOP_N);
+  const labels = top.map(r => r.skill);
+
+  charts.skillChart = new Chart(document.getElementById('skillChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        // Tool calls (primary, dark brown) on the larger top axis,
+        // sessions (coral) on the smaller bottom axis — same dual-axis
+        // pattern as the Topics chart so the two read consistently.
+        { label: 'Tool calls', data: top.map(r => r.calls),    xAxisID: 'xCalls',    backgroundColor: '#7A4F37', borderWidth: 0, borderRadius: 3 },
+        { label: 'Sessions',   data: top.map(r => r.sessions), xAxisID: 'xSessions', backgroundColor: '#CC785C', borderWidth: 0, borderRadius: 3 },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        xCalls: {
+          position: 'top',
+          grid: { color: '#EDE9DC' },
+          ticks: { callback: v => compact(v), color: '#7A4F37' },
+          title: { display: true, text: 'Tool calls', color: '#7A4F37', font: { size: 11, weight: '600' } },
+        },
+        xSessions: {
+          position: 'bottom',
+          grid: { display: false },
+          ticks: { callback: v => compact(v), color: '#CC785C' },
+          title: { display: true, text: 'Sessions', color: '#CC785C', font: { size: 11, weight: '600' } },
+        },
+        y: { grid: { display: false }, ticks: { font: { size: 12 } } },
+      },
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw)}`,
+            afterBody: items => {
+              const row = top[items[0].dataIndex];
+              const ratio = row.sessions > 0 ? (row.calls/row.sessions).toFixed(1) : '—';
+              return `${ratio} tool calls per session using this skill`;
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
 // ============== Programming languages ==============
 function aggregateLangsFromEvents(filteredEvents) {
   const reads = {}, edits = {};
@@ -2988,6 +3173,7 @@ function applyFilters() {
   renderMCP(aggregateMCPFromEvents(filteredEvents), filteredEvents.length);
   renderResearch(aggregateResearchFromEvents(filteredEvents), filteredEvents.length);
   renderTopics();
+  renderSkills();
   renderLangs(aggregateLangsFromEvents(filteredEvents));
 
   // 6) Model breakdown table.
@@ -3083,8 +3269,13 @@ function populateAllPopovers() {
     .sort((a, b) => a.label.localeCompare(b.label));
   buildPopover('popServers', serverOpts, state.servers, false);
 
-  // Skills: skip index 0.
-  const skillOpts = DIMS.skills.slice(1).map((label, i) => ({ label, value: i + 1 }))
+  // Skills: skip the "(none)" placeholder at index 0, then drop Claude
+  // Code built-in slash commands so the dropdown only lists user-defined
+  // skills (matches the chart). Built-ins are still detected and stored in
+  // DIMS.skills so any cached state remains consistent; we just hide them
+  // from the filter UI.
+  const skillOpts = DIMS.skills.map((label, i) => ({ label, value: i }))
+    .filter(o => o.value !== 0 && !SLASH_BUILTINS.has(o.label))
     .sort((a, b) => a.label.localeCompare(b.label));
   buildPopover('popSkills', skillOpts, state.skills, skillOpts.length > 8);
 
